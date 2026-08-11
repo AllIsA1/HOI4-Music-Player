@@ -1,4 +1,4 @@
-"""Persistent user settings: added folders, volume, playback mode, enabled mods."""
+"""Persistent user settings: added folders, volume, which stations are enabled."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,7 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 
 DEFAULTS = {
     "folders": [],
-    "disabled_mod_ids": [],
+    "disabled_station_keys": [],
     "volume": 0.7,
 }
 
@@ -58,16 +58,16 @@ class Config:
         return True
 
     @property
-    def disabled_mod_ids(self) -> set[str]:
-        return set(self.data["disabled_mod_ids"])
+    def disabled_station_keys(self) -> set[str]:
+        return set(self.data["disabled_station_keys"])
 
-    def set_mod_enabled(self, mod_id: str, enabled: bool) -> None:
-        disabled = set(self.data["disabled_mod_ids"])
+    def set_station_enabled(self, station_key: str, enabled: bool) -> None:
+        disabled = set(self.data["disabled_station_keys"])
         if enabled:
-            disabled.discard(mod_id)
+            disabled.discard(station_key)
         else:
-            disabled.add(mod_id)
-        self.data["disabled_mod_ids"] = sorted(disabled)
+            disabled.add(station_key)
+        self.data["disabled_station_keys"] = sorted(disabled)
         self.save()
 
     @property

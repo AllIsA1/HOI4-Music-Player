@@ -1,4 +1,4 @@
-"""Data models for mods and tracks."""
+"""Data models for stations and tracks."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,6 +14,7 @@ class Track:
     mod_name: str
     mod_author: str
     mod_id: str
+    station_name: str = ""
     mod_icon: Optional[Path] = None
     volume: float = 1.0
     duration: Optional[float] = None
@@ -24,12 +25,17 @@ class Track:
 
 
 @dataclass
-class Mod:
-    mod_id: str
+class Station:
+    """A radio station (music channel) as defined by a mod's
+    `music_station = "..."` assignment files. Mods that don't use the
+    station system at all get a single fallback station named after
+    themselves, so every track always belongs to exactly one station."""
+
+    key: str
     name: str
-    author: str
-    root: Path
-    icon: Optional[Path] = None
+    mod_name: str
+    mod_author: str
+    mod_icon: Optional[Path] = None
     tracks: list[Track] = field(default_factory=list)
 
     @property

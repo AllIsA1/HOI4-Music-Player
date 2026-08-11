@@ -1,0 +1,8 @@
+music_station = "utagoe"
+
+music = {
+	song = "DaiNipponNoUta"
+	chance = {
+		factor = 1
+	}
+}

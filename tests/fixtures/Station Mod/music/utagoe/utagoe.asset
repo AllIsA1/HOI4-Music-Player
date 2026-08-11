@@ -1,0 +1,5 @@
+music = {
+	name = "DaiNipponNoUta"
+	file = "DaiNipponNoUta.wav"
+	volume = 0.65
+}

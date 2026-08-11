@@ -1,6 +1,7 @@
 """Small GUI helpers: time formatting and icon loading/caching."""
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +43,26 @@ def _make_default_icon(size: int) -> Image.Image:
     ]
     draw.polygon(flag_pts, fill=_ICON_FG)
     return img.resize((size, size), Image.LANCZOS)
+
+
+def get_app_icon_image(size: int = 64) -> Image.Image:
+    """The app's note-glyph icon as a plain PIL image (not a CTkImage), for
+    use as the window/taskbar icon via Tk's iconphoto/iconbitmap - it's
+    generated in-process rather than loaded from a bundled file, so the
+    packaged .exe doesn't need any asset files shipped alongside it."""
+    return _make_default_icon(size)
+
+
+def get_app_icon_ico_path() -> Path:
+    """Writes (once per run) a multi-resolution .ico of the app icon to a
+    temp file and returns its path, for Tk's Windows-only iconbitmap()."""
+    tmp_dir = Path(tempfile.gettempdir()) / "hoi4_music_player"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    ico_path = tmp_dir / "app_icon.ico"
+    if not ico_path.exists():
+        img = _make_default_icon(256)
+        img.save(ico_path, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    return ico_path
 
 
 def get_default_icon(size: int) -> ctk.CTkImage:

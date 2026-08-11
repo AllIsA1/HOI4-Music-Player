@@ -1,12 +1,14 @@
 """CustomTkinter-based UI for the HOI4 Music Player."""
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
 
 import customtkinter as ctk
 from tkinter import filedialog
+from PIL import ImageTk
 
 from . import theme
 from .config import Config
@@ -21,9 +23,9 @@ from .icons import (
     volume_icon,
 )
 from .mod_scanner import scan_folders_detailed
-from .models import Mod, Track
+from .models import Station, Track
 from .player_engine import PlayerEngine
-from .utils import format_time, get_icon_image
+from .utils import format_time, get_app_icon_image, get_app_icon_ico_path, get_icon_image
 
 ctk.set_appearance_mode("dark")
 
@@ -82,10 +84,10 @@ class _HoverRow(ctk.CTkFrame):
         self.configure(fg_color=_ROW_COLORS[state])
 
 
-class ModRow(_HoverRow):
-    def __init__(self, master, mod: Mod, enabled: bool, on_toggle, on_select):
+class StationRow(_HoverRow):
+    def __init__(self, master, station: Station, enabled: bool, on_toggle, on_select):
         super().__init__(master)
-        self.mod = mod
+        self.station = station
         self.on_select = on_select
 
         self.grid_columnconfigure(2, weight=1)
@@ -95,20 +97,20 @@ class ModRow(_HoverRow):
             self, text="", variable=self.checkbox_var, width=20,
             fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
             checkmark_color=theme.ACCENT_TEXT, border_color=theme.TEXT_MUTED,
-            command=lambda: on_toggle(mod.mod_id, self.checkbox_var.get()),
+            command=lambda: on_toggle(station.key, self.checkbox_var.get()),
         )
         checkbox.grid(row=0, column=0, rowspan=2, padx=(8, 4), pady=8)
 
-        icon_label = ctk.CTkLabel(self, text="", image=get_icon_image(mod.icon, SIDEBAR_ICON_SIZE))
+        icon_label = ctk.CTkLabel(self, text="", image=get_icon_image(station.mod_icon, SIDEBAR_ICON_SIZE))
         icon_label.grid(row=0, column=1, rowspan=2, padx=(2, 10), pady=8)
 
         name_label = ctk.CTkLabel(
-            self, text=mod.name, anchor="w", text_color=theme.TEXT_PRIMARY,
+            self, text=station.name, anchor="w", text_color=theme.TEXT_PRIMARY,
             font=ctk.CTkFont(weight="bold"), wraplength=SIDEBAR_LABEL_WRAP, justify="left",
         )
         name_label.grid(row=0, column=2, sticky="ew", padx=(0, 10), pady=(8, 0))
 
-        subtitle = f"{mod.author} • {mod.track_count} tracks"
+        subtitle = f"{station.mod_name} • {station.track_count} tracks"
         sub_label = ctk.CTkLabel(
             self, text=subtitle, anchor="w", font=ctk.CTkFont(size=11),
             text_color=theme.TEXT_SECONDARY, wraplength=SIDEBAR_LABEL_WRAP, justify="left",
@@ -116,7 +118,7 @@ class ModRow(_HoverRow):
         sub_label.grid(row=1, column=2, sticky="ew", padx=(0, 10), pady=(0, 8))
 
         for widget in (self, icon_label, name_label, sub_label):
-            widget.bind("<Button-1>", lambda e: self.on_select(mod.mod_id))
+            widget.bind("<Button-1>", lambda e: self.on_select(station.key))
             self._bind_hover(widget)
 
     def set_selected(self, selected: bool):
@@ -247,6 +249,7 @@ class App(ctk.CTk):
         self.geometry("1080x700")
         self.minsize(880, 580)
         self.configure(fg_color=theme.BG_APP)
+        self._set_window_icon()
 
         self.config_store = Config()
         self.player = PlayerEngine()
@@ -254,10 +257,10 @@ class App(ctk.CTk):
         self.player.on_track_change = self._on_track_change
         self.player.on_playback_state_change = self._on_playback_state_change
 
-        self.mods: list[Mod] = []
-        self.mod_rows: dict[str, ModRow] = {}
+        self.stations: list[Station] = []
+        self.station_rows: dict[str, StationRow] = {}
         self.track_rows: list[TrackRow] = []
-        self.selected_mod_id: Optional[str] = None
+        self.selected_station_key: Optional[str] = None
         self.current_display_tracks: list[Track] = []
         self._scanning = False
         self._search_after_id: Optional[str] = None
@@ -271,6 +274,24 @@ class App(ctk.CTk):
         self._tick()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_window_icon(self):
+        # PyInstaller's --icon only sets the .exe file's icon in Explorer,
+        # not the running window/taskbar icon (which was showing Tk's
+        # default feather logo) - it has to be set at runtime too. Generate
+        # the icon in-process (see utils.get_app_icon_image) rather than
+        # loading a bundled file, so the packaged .exe doesn't need any
+        # asset files shipped alongside it.
+        try:
+            self._window_icon_photo = ImageTk.PhotoImage(get_app_icon_image(64))
+            self.iconphoto(True, self._window_icon_photo)
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            try:
+                self.iconbitmap(str(get_app_icon_ico_path()))
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ UI
     def _build_layout(self):
@@ -304,33 +325,33 @@ class App(ctk.CTk):
         self.status_label.pack(side="left", padx=14)
 
         search_entry = ctk.CTkEntry(
-            top_bar, placeholder_text="Search tracks, mods, authors…",
+            top_bar, placeholder_text="Search tracks, stations, mods…",
             textvariable=self.search_var, width=260, fg_color=theme.BG_ROW,
             border_color=theme.BORDER, text_color=theme.TEXT_PRIMARY,
         )
         search_entry.pack(side="right", padx=16, pady=10)
 
-        # Sidebar (mods). Fixed width - a live drag-to-resize handle was
+        # Sidebar (stations). Fixed width - a live drag-to-resize handle was
         # tried and reverted: CTkFrame's canvas redraw couldn't keep up
         # with rapid <B1-Motion> events and left visible ghost artifacts on
-        # screen. Long mod names just wrap onto extra lines instead (see
-        # SIDEBAR_LABEL_WRAP), so a fixed width doesn't clip anything.
+        # screen. Long station names just wrap onto extra lines instead
+        # (see SIDEBAR_LABEL_WRAP), so a fixed width doesn't clip anything.
         self.sidebar = ctk.CTkFrame(self, width=SIDEBAR_WIDTH, corner_radius=0, fg_color=theme.BG_SIDEBAR)
         self.sidebar.grid(row=1, column=0, sticky="ns")
         self.sidebar.grid_propagate(False)
         ctk.CTkLabel(
-            self.sidebar, text="MODS", font=ctk.CTkFont(size=12, weight="bold"),
+            self.sidebar, text="STATIONS", font=ctk.CTkFont(size=12, weight="bold"),
             text_color=theme.TEXT_MUTED,
         ).pack(anchor="w", padx=16, pady=(16, 6))
-        self.all_mods_row = _styled_button(
-            self.sidebar, text="All Mods", anchor="w",
+        self.all_stations_row = _styled_button(
+            self.sidebar, text="All Stations", anchor="w",
             fg_color=theme.BG_ROW_SELECTED, hover_color=theme.BG_ROW_HOVER,
-            command=lambda: self._select_mod(None),
+            command=lambda: self._select_station(None),
         )
-        self.all_mods_row.pack(fill="x", padx=14, pady=(0, 10))
+        self.all_stations_row.pack(fill="x", padx=14, pady=(0, 10))
 
-        self.mods_scroll = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent", label_text="")
-        self.mods_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.stations_scroll = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent", label_text="")
+        self.stations_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         # Track list
         track_panel = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_PANEL)
@@ -442,17 +463,17 @@ class App(ctk.CTk):
         self.status_label.configure(text="Scanning…")
 
         def work():
-            mods, empty_mod_names = scan_folders_detailed([Path(f) for f in folders])
-            self.after(0, lambda: self._on_scan_complete(mods, empty_mod_names))
+            stations, empty_mod_names = scan_folders_detailed([Path(f) for f in folders])
+            self.after(0, lambda: self._on_scan_complete(stations, empty_mod_names))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_scan_complete(self, mods: list[Mod], empty_mod_names: list[str] = ()):
+    def _on_scan_complete(self, stations: list[Station], empty_mod_names: list[str] = ()):
         self._scanning = False
-        self.mods = mods
-        total_tracks = sum(m.track_count for m in mods)
-        if mods:
-            status = f"{len(mods)} mods, {total_tracks} tracks"
+        self.stations = stations
+        total_tracks = sum(s.track_count for s in stations)
+        if stations:
+            status = f"{len(stations)} stations, {total_tracks} tracks"
             if empty_mod_names:
                 status += f" ({len(empty_mod_names)} more found with no music/ tracks)"
             self.status_label.configure(text=status)
@@ -463,7 +484,7 @@ class App(ctk.CTk):
             self.status_label.configure(text=f"Found mod(s) ({names}) but no tracks in their music/ folder")
         elif self.config_store.folders:
             self.status_label.configure(text="No .mod/descriptor.mod found in the added folders")
-        self._rebuild_mod_list()
+        self._rebuild_station_list()
         self._refresh_track_list()
 
         # Read every track's length up front so the list shows real times
@@ -473,7 +494,7 @@ class App(ctk.CTk):
         # unrecoverable interpreter crash (GIL corruption) when running
         # concurrently with pygame's mixer + the Tk mainloop. Chunking
         # keeps each pause imperceptible even for large mods.
-        self._duration_backlog = [t for m in mods for t in m.tracks if t.duration is None]
+        self._duration_backlog = [t for s in stations for t in s.tracks if t.duration is None]
         if self._duration_backlog:
             self.after(50, self._process_duration_backlog)
 
@@ -499,53 +520,53 @@ class App(ctk.CTk):
         self._search_after_id = None
         self._refresh_track_list()
 
-    # ---------------------------------------------------------------- mods
-    def _rebuild_mod_list(self):
-        for child in self.mods_scroll.winfo_children():
+    # ------------------------------------------------------------ stations
+    def _rebuild_station_list(self):
+        for child in self.stations_scroll.winfo_children():
             child.destroy()
-        self.mod_rows.clear()
+        self.station_rows.clear()
 
-        valid_ids = {m.mod_id for m in self.mods}
-        if self.selected_mod_id not in valid_ids:
-            self.selected_mod_id = None
+        valid_keys = {s.key for s in self.stations}
+        if self.selected_station_key not in valid_keys:
+            self.selected_station_key = None
 
-        for mod in self.mods:
-            enabled = mod.mod_id not in self.config_store.disabled_mod_ids
-            row = ModRow(
-                self.mods_scroll, mod, enabled,
-                on_toggle=self._on_mod_toggle, on_select=self._select_mod,
+        for station in self.stations:
+            enabled = station.key not in self.config_store.disabled_station_keys
+            row = StationRow(
+                self.stations_scroll, station, enabled,
+                on_toggle=self._on_station_toggle, on_select=self._select_station,
             )
             row.pack(fill="x", pady=4)
-            row.set_selected(self.selected_mod_id == mod.mod_id)
-            self.mod_rows[mod.mod_id] = row
+            row.set_selected(self.selected_station_key == station.key)
+            self.station_rows[station.key] = row
 
-        self.all_mods_row.configure(
-            fg_color=theme.BG_ROW_SELECTED if self.selected_mod_id is None else theme.BUTTON_NEUTRAL
+        self.all_stations_row.configure(
+            fg_color=theme.BG_ROW_SELECTED if self.selected_station_key is None else theme.BUTTON_NEUTRAL
         )
 
-    def _on_mod_toggle(self, mod_id: str, enabled: bool):
-        self.config_store.set_mod_enabled(mod_id, enabled)
+    def _on_station_toggle(self, station_key: str, enabled: bool):
+        self.config_store.set_station_enabled(station_key, enabled)
         self._refresh_track_list()
 
-    def _select_mod(self, mod_id: Optional[str]):
-        self.selected_mod_id = mod_id
-        for mid, row in self.mod_rows.items():
-            row.set_selected(mid == mod_id)
-        self.all_mods_row.configure(
-            fg_color=theme.BG_ROW_SELECTED if mod_id is None else theme.BUTTON_NEUTRAL
+    def _select_station(self, station_key: Optional[str]):
+        self.selected_station_key = station_key
+        for key, row in self.station_rows.items():
+            row.set_selected(key == station_key)
+        self.all_stations_row.configure(
+            fg_color=theme.BG_ROW_SELECTED if station_key is None else theme.BUTTON_NEUTRAL
         )
         self._refresh_track_list()
 
     # -------------------------------------------------------------- tracks
-    def _visible_mods(self) -> list[Mod]:
-        # A disabled mod's tracks never show up, whether browsing "All
-        # Mods" or that mod specifically - the checkbox is the single
-        # source of truth for "will this mod's music ever play".
-        disabled = self.config_store.disabled_mod_ids
-        enabled_mods = [m for m in self.mods if m.mod_id not in disabled]
-        if self.selected_mod_id is not None:
-            return [m for m in enabled_mods if m.mod_id == self.selected_mod_id]
-        return enabled_mods
+    def _visible_stations(self) -> list[Station]:
+        # A disabled station's tracks never show up, whether browsing "All
+        # Stations" or that station specifically - the checkbox is the
+        # single source of truth for "will this station's music ever play".
+        disabled = self.config_store.disabled_station_keys
+        enabled_stations = [s for s in self.stations if s.key not in disabled]
+        if self.selected_station_key is not None:
+            return [s for s in enabled_stations if s.key == self.selected_station_key]
+        return enabled_stations
 
     def _refresh_track_list(self):
         for child in self.tracks_scroll.winfo_children():
@@ -554,16 +575,17 @@ class App(ctk.CTk):
 
         query = self.search_var.get().strip().lower()
         tracks: list[Track] = []
-        for mod in self._visible_mods():
-            tracks.extend(mod.tracks)
+        for station in self._visible_stations():
+            tracks.extend(station.tracks)
         if query:
             tracks = [
                 t for t in tracks
                 if query in t.display_name.lower()
                 or query in t.mod_name.lower()
                 or query in t.mod_author.lower()
+                or query in t.station_name.lower()
             ]
-        tracks.sort(key=lambda t: (t.mod_name.lower(), t.display_name.lower()))
+        tracks.sort(key=lambda t: (t.station_name.lower(), t.display_name.lower()))
         self.current_display_tracks = tracks
 
         self.track_count_label.configure(text=f"Tracks ({len(tracks)})")

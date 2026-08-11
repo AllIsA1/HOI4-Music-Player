@@ -1,0 +1,15 @@
+music_station = "gunka"
+
+music = {
+	song = "AgeyoHinomaru"
+	chance = {
+		factor = 1
+	}
+}
+
+music = {
+	song = "Battoutai"
+	chance = {
+		factor = 1
+	}
+}

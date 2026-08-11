@@ -1,12 +1,25 @@
 """
 Scans user-supplied folders for Hearts of Iron IV mods and extracts music
-track metadata straight from the real mod file structure:
+track metadata straight from the real mod file structure, per the official
+modding wiki (https://hoi4.paradoxwikis.com/Music_modding), cross-checked
+against real published mods:
 
-    <content_root>/music/**/*.txt          -> music = { song = "..." file = "..." volume = ... }
-    <content_root>/localisation/**/*.yml   -> localisation of song keys -> display titles
+    <content_root>/music/**/*.asset        -> song DEFINITIONS:
+                                               music = { name = "KEY" file = "x.ogg" volume = 0.65 }
+    <content_root>/music/**/*.txt          -> station ASSIGNMENTS:
+                                               music_station = "station_key"
+                                               music = { song = "KEY" chance = { ... } }
+    <content_root>/localisation/**/*.yml   -> song titles (by KEY) and station
+                                               display names (by "station_key_TITLE")
 
-No extra/custom config files are required or read. This mirrors the format
-Paradox and mod authors actually ship music mods in.
+A song is only ever defined once (in a .asset file, by `name`/`file`), then
+referenced by `song = "KEY"` from one or more station-assignment .txt files.
+Mods that don't use the station system just put `file =` directly alongside
+`song =`/`name =` in the same block - that's supported too (see
+parse_song_definitions), with all such songs grouped under a fallback
+station named after the mod itself.
+
+No extra/custom config files are required or read.
 
 HOI4 mods are installed on disk in one of two real layouts, and both are
 supported here:
@@ -28,7 +41,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from .models import Mod, Track
+from .models import Station, Track
 
 AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav"}
 MAX_DESCRIPTOR_SEARCH_DEPTH = 4
@@ -214,32 +227,81 @@ def _resolve_audio_path(mod_root: Path, raw_path: str) -> Optional[Path]:
     return None
 
 
-def parse_music_tracks(mod_root: Path) -> list[dict]:
-    music_dir = mod_root / "music"
+def parse_song_definitions(content_root: Path) -> dict[str, dict]:
+    """Song DEFINITIONS: real mods put these in `*.asset` files using
+    `name = "KEY"`, but some simpler mods skip .asset entirely and put
+    `song = "KEY"` + `file = "..."` directly together in one .txt block -
+    both are accepted here. A block only counts as a definition if it has
+    a `file =` field; blocks with just `song =` (and no `file =`) are
+    station ASSIGNMENTS instead (see parse_station_assignments) and are
+    intentionally skipped here.
+    Returns song_key -> {"file": str, "volume": float}."""
+    music_dir = content_root / "music"
+    definitions: dict[str, dict] = {}
     if not music_dir.is_dir():
-        return []
+        return definitions
 
-    raw_tracks: list[dict] = []
+    paths = sorted(music_dir.rglob("*.asset")) + sorted(music_dir.rglob("*.txt"))
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        text = _strip_comments(text)
+        for block in _find_blocks(text, "music"):
+            file_match = re.search(r'file\s*=\s*"([^"]*)"', block)
+            if not file_match:
+                continue
+            name_match = re.search(r'(?:name|song)\s*=\s*"([^"]*)"', block)
+            if not name_match:
+                continue
+            volume_match = re.search(r"volume\s*=\s*([\d.]+)", block)
+            definitions.setdefault(
+                name_match.group(1),
+                {
+                    "file": file_match.group(1),
+                    "volume": float(volume_match.group(1)) if volume_match else 1.0,
+                },
+            )
+    return definitions
+
+
+def parse_station_assignments(content_root: Path) -> dict[str, list[str]]:
+    """Station ASSIGNMENTS: `*.txt` files under music/ that declare
+    `music_station = "station_key"` once, followed by `music = { song =
+    "KEY" chance = {...} }` blocks referencing songs by the name they were
+    given in a .asset file. Returns station_key -> [song_key, ...]."""
+    music_dir = content_root / "music"
+    assignments: dict[str, list[str]] = {}
+    if not music_dir.is_dir():
+        return assignments
+
     for txt_path in sorted(music_dir.rglob("*.txt")):
         try:
             text = txt_path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
         text = _strip_comments(text)
-        for block in _find_blocks(text, "music"):
-            song_match = re.search(r'song\s*=\s*"([^"]*)"', block)
-            file_match = re.search(r'file\s*=\s*"([^"]*)"', block)
-            volume_match = re.search(r"volume\s*=\s*([\d.]+)", block)
-            if not song_match or not file_match:
-                continue
-            raw_tracks.append(
-                {
-                    "song": song_match.group(1),
-                    "file": file_match.group(1),
-                    "volume": float(volume_match.group(1)) if volume_match else 1.0,
-                }
-            )
-    return raw_tracks
+        station_match = re.search(r'music_station\s*=\s*"([^"]*)"', text)
+        if not station_match:
+            continue
+        station_key = station_match.group(1)
+        song_keys = [
+            m.group(1)
+            for block in _find_blocks(text, "music")
+            for m in [re.search(r'song\s*=\s*"([^"]*)"', block)]
+            if m
+        ]
+        if song_keys:
+            assignments.setdefault(station_key, []).extend(song_keys)
+    return assignments
+
+
+def _station_display_name(localisation: dict[str, str], station_key: str) -> str:
+    for candidate in (f"{station_key}_TITLE", station_key):
+        if candidate in localisation:
+            return localisation[candidate]
+    return station_key.replace("_", " ").replace("-", " ").strip().title() or station_key
 
 
 def _guess_author(descriptor: dict, mod_root: Path) -> str:
@@ -261,91 +323,126 @@ def _guess_author(descriptor: dict, mod_root: Path) -> str:
     return "Unknown"
 
 
-def load_mod(descriptor_path: Path, content_root: Path) -> Optional[Mod]:
-    descriptor = parse_descriptor(descriptor_path)
-    name = descriptor.get("name", content_root.name).strip() or content_root.name
-    author = _guess_author(descriptor, content_root)
-
-    icon: Optional[Path] = None
+def _resolve_mod_icon(descriptor: dict, descriptor_path: Path, content_root: Path) -> Optional[Path]:
     picture_name = descriptor.get("picture")
     if picture_name:
         for base in (content_root, descriptor_path.parent):
             candidate = base / picture_name
             if candidate.is_file():
-                icon = candidate
-                break
-    if icon is None:
-        for fallback in ("thumbnail.png", "thumbnail.jpg"):
-            candidate = content_root / fallback
-            if candidate.is_file():
-                icon = candidate
-                break
+                return candidate
+    for fallback in ("thumbnail.png", "thumbnail.jpg"):
+        candidate = content_root / fallback
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_stations(descriptor_path: Path, content_root: Path) -> list[Station]:
+    """Build every Station for one mod: real stations from music_station
+    assignments, plus a fallback station (named after the mod) for any
+    defined songs that were never assigned to a station."""
+    descriptor = parse_descriptor(descriptor_path)
+    mod_name = descriptor.get("name", content_root.name).strip() or content_root.name
+    author = _guess_author(descriptor, content_root)
+    icon = _resolve_mod_icon(descriptor, descriptor_path, content_root)
+    mod_id = str(content_root.resolve())
 
     localisation = parse_localisation(content_root)
-    raw_tracks = parse_music_tracks(content_root)
-    if not raw_tracks:
-        return None
+    definitions = parse_song_definitions(content_root)
+    assignments = parse_station_assignments(content_root)
 
-    mod_id = str(content_root.resolve())
-    mod = Mod(mod_id=mod_id, name=name, author=author, root=content_root, icon=icon)
-
-    seen_files: set[str] = set()
-    for raw in raw_tracks:
-        resolved = _resolve_audio_path(content_root, raw["file"])
-        if resolved is None:
-            continue
-        if resolved.suffix.lower() not in AUDIO_EXTENSIONS:
-            continue
-        key = str(resolved.resolve())
-        if key in seen_files:
-            continue
-        seen_files.add(key)
-
-        song_key = raw["song"]
-        title = localisation.get(song_key, song_key)
-        mod.tracks.append(
-            Track(
-                song_key=song_key,
-                title=title,
-                file_path=resolved,
-                mod_name=name,
-                mod_author=author,
-                mod_id=mod_id,
-                mod_icon=icon,
-                volume=raw["volume"],
-            )
+    def build_track(song_key: str, station_name: str) -> Optional[Track]:
+        definition = definitions.get(song_key)
+        if definition is None:
+            return None
+        resolved = _resolve_audio_path(content_root, definition["file"])
+        if resolved is None or resolved.suffix.lower() not in AUDIO_EXTENSIONS:
+            return None
+        return Track(
+            song_key=song_key,
+            title=localisation.get(song_key, song_key),
+            file_path=resolved,
+            mod_name=mod_name,
+            mod_author=author,
+            mod_id=mod_id,
+            station_name=station_name,
+            mod_icon=icon,
+            volume=definition["volume"],
         )
 
-    if not mod.tracks:
-        return None
-    mod.tracks.sort(key=lambda t: t.title.lower())
-    return mod
+    stations: list[Station] = []
+    assigned_song_keys: set[str] = set()
+
+    for station_key, song_keys in assignments.items():
+        station_name = _station_display_name(localisation, station_key)
+        station = Station(
+            key=f"{mod_id}::{station_key}", name=station_name,
+            mod_name=mod_name, mod_author=author, mod_icon=icon,
+        )
+        seen_files: set[str] = set()
+        for song_key in song_keys:
+            assigned_song_keys.add(song_key)
+            track = build_track(song_key, station_name)
+            if track is None:
+                continue
+            file_key = str(track.file_path.resolve())
+            if file_key in seen_files:
+                continue
+            seen_files.add(file_key)
+            station.tracks.append(track)
+        if station.tracks:
+            station.tracks.sort(key=lambda t: t.title.lower())
+            stations.append(station)
+
+    leftover_keys = sorted(k for k in definitions if k not in assigned_song_keys)
+    if leftover_keys:
+        fallback = Station(
+            key=f"{mod_id}::__default__", name=mod_name,
+            mod_name=mod_name, mod_author=author, mod_icon=icon,
+        )
+        seen_files = set()
+        for song_key in leftover_keys:
+            track = build_track(song_key, mod_name)
+            if track is None:
+                continue
+            file_key = str(track.file_path.resolve())
+            if file_key in seen_files:
+                continue
+            seen_files.add(file_key)
+            fallback.tracks.append(track)
+        if fallback.tracks:
+            fallback.tracks.sort(key=lambda t: t.title.lower())
+            stations.append(fallback)
+
+    stations.sort(key=lambda s: s.name.lower())
+    return stations
 
 
-def scan_folders_detailed(folders: list[Path]) -> tuple[list[Mod], list[str]]:
+def scan_folders_detailed(folders: list[Path]) -> tuple[list[Station], list[str]]:
     """Like scan_folders, but also reports mods that were found (had a valid
-    descriptor) but contributed zero tracks - useful for telling "nothing
-    detected at all" apart from "found your mod, but couldn't parse its
-    music/ files", which otherwise look identical to the user."""
-    mods_by_id: dict[str, Mod] = {}
+    descriptor) but contributed zero stations/tracks - useful for telling
+    "nothing detected at all" apart from "found your mod, but couldn't
+    parse its music/ files", which otherwise look identical to the user."""
+    stations_by_key: dict[str, Station] = {}
     empty_mod_names: list[str] = []
     for folder in folders:
         folder = Path(folder)
         if not folder.is_dir():
             continue
         for descriptor_path, content_root in find_mod_entries(folder):
-            mod = load_mod(descriptor_path, content_root)
-            if mod is None:
+            stations = load_stations(descriptor_path, content_root)
+            if not stations:
                 descriptor = parse_descriptor(descriptor_path)
                 empty_mod_names.append(descriptor.get("name", content_root.name).strip() or content_root.name)
                 continue
-            mods_by_id[mod.mod_id] = mod
-    mods = sorted(mods_by_id.values(), key=lambda m: m.name.lower())
-    return mods, empty_mod_names
+            for station in stations:
+                stations_by_key[station.key] = station
+    result = sorted(stations_by_key.values(), key=lambda s: s.name.lower())
+    return result, empty_mod_names
 
 
-def scan_folders(folders: list[Path]) -> list[Mod]:
-    """Scan every supplied folder for HOI4 music mods and return a list of
-    Mod objects (deduplicated by resolved content root)."""
-    mods, _empty = scan_folders_detailed(folders)
-    return mods
+def scan_folders(folders: list[Path]) -> list[Station]:
+    """Scan every supplied folder for HOI4 music mods and return every
+    Station found (deduplicated by station key)."""
+    stations, _empty = scan_folders_detailed(folders)
+    return stations
