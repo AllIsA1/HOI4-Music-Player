@@ -54,8 +54,8 @@ Grab the latest Windows build from the [Releases page](../../releases) — a sin
 Requires **Python 3.10+**.
 
 ```bash
-git clone https://github.com/<your-org>/hoi4-music-player.git
-cd hoi4-music-player
+git clone https://github.com/AllIsA1/HOI4-Music-Player.git
+cd HOI4-Music-Player
 python -m venv .venv
 ```
 
