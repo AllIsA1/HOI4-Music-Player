@@ -209,22 +209,34 @@ def parse_localisation(mod_root: Path) -> dict[str, str]:
     return result
 
 
-def _resolve_audio_path(mod_root: Path, raw_path: str) -> Optional[Path]:
+def _build_music_file_index(content_root: Path) -> dict[str, Path]:
+    """Maps every filename under music/ to its full path, in one pass. The
+    real .asset format's `file =` is just a bare filename with no
+    directory (tracks live in per-station subfolders), so this fallback
+    lookup is needed for essentially every track - doing it as a fresh
+    rglob() per track instead of once per mod turned a few thousand tracks
+    into tens of millions of filesystem stats and effectively hung the app."""
+    music_dir = content_root / "music"
+    index: dict[str, Path] = {}
+    if not music_dir.is_dir():
+        return index
+    for path in music_dir.rglob("*"):
+        if path.is_file():
+            index.setdefault(path.name, path)
+    return index
+
+
+def _resolve_audio_path(content_root: Path, raw_path: str, file_index: dict[str, Path]) -> Optional[Path]:
     raw_path = raw_path.replace("\\", "/").strip()
-    candidate = mod_root / raw_path
+    candidate = content_root / raw_path
     if candidate.is_file():
         return candidate
 
     # Some mods reference files relative to the mod root without the
-    # "music/" prefix matching the actual folder casing/layout - fall back
-    # to searching for the basename anywhere under music/.
-    basename = Path(raw_path).name
-    music_dir = mod_root / "music"
-    if music_dir.is_dir():
-        for match in music_dir.rglob(basename):
-            if match.is_file():
-                return match
-    return None
+    # "music/" prefix matching the actual folder casing/layout, or (the
+    # common case for the real .asset format) with no directory at all -
+    # fall back to the precomputed basename index instead of rescanning.
+    return file_index.get(Path(raw_path).name)
 
 
 def parse_song_definitions(content_root: Path) -> dict[str, dict]:
@@ -350,12 +362,13 @@ def load_stations(descriptor_path: Path, content_root: Path) -> list[Station]:
     localisation = parse_localisation(content_root)
     definitions = parse_song_definitions(content_root)
     assignments = parse_station_assignments(content_root)
+    file_index = _build_music_file_index(content_root)
 
     def build_track(song_key: str, station_name: str) -> Optional[Track]:
         definition = definitions.get(song_key)
         if definition is None:
             return None
-        resolved = _resolve_audio_path(content_root, definition["file"])
+        resolved = _resolve_audio_path(content_root, definition["file"], file_index)
         if resolved is None or resolved.suffix.lower() not in AUDIO_EXTENSIONS:
             return None
         return Track(

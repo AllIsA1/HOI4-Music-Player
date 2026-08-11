@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Optional
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 
 _icon_cache: dict[tuple[str, int], ctk.CTkImage] = {}
 _default_icon_cache: dict[int, ctk.CTkImage] = {}
+_icon_photo_cache: dict[tuple[Optional[str], int], ImageTk.PhotoImage] = {}
 
 
 def format_time(seconds: Optional[float]) -> str:
@@ -89,3 +90,23 @@ def get_icon_image(path: Optional[Path], size: int) -> ctk.CTkImage:
     ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
     _icon_cache[key] = ctk_img
     return ctk_img
+
+
+def get_icon_photo(path: Optional[Path], size: int) -> ImageTk.PhotoImage:
+    """Same as get_icon_image, but as a plain Tk PhotoImage - needed for
+    widgets that don't understand CTkImage, like ttk.Treeview row icons."""
+    key = (str(path) if path is not None else None, size)
+    cached = _icon_photo_cache.get(key)
+    if cached is not None:
+        return cached
+    img = None
+    if path is not None:
+        try:
+            img = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+        except Exception:
+            img = None
+    if img is None:
+        img = _make_default_icon(size)
+    photo = ImageTk.PhotoImage(img)
+    _icon_photo_cache[key] = photo
+    return photo

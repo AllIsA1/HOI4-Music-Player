@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import threading
 from pathlib import Path
+from tkinter import ttk
 from typing import Optional
 
 import customtkinter as ctk
@@ -25,12 +26,17 @@ from .icons import (
 from .mod_scanner import scan_folders_detailed
 from .models import Station, Track
 from .player_engine import PlayerEngine
-from .utils import format_time, get_app_icon_image, get_app_icon_ico_path, get_icon_image
+from .utils import (
+    format_time,
+    get_app_icon_image,
+    get_app_icon_ico_path,
+    get_icon_image,
+    get_icon_photo,
+)
 
 ctk.set_appearance_mode("dark")
 
 SIDEBAR_ICON_SIZE = 40
-TRACK_ICON_SIZE = 36
 NOWPLAYING_ICON_SIZE = 56
 SIDEBAR_WIDTH = 320
 
@@ -42,14 +48,12 @@ _ROW_COLORS = {
 }
 
 
-# Static wrap widths for row labels, rather than clipping long names. A
-# dynamic (per-resize) wraplength and a resizable sidebar were both tried
-# and reverted - see gui.py history/README - reconfiguring widget geometry
-# on every pixel of drag/resize motion made customtkinter's canvas redraw
-# fall behind and leave visible artifacts on screen. A long mod or track
-# name just wraps onto a second or third line instead.
+# Static wrap width for sidebar station rows, rather than clipping long
+# names. A dynamic (per-resize) wraplength and a resizable sidebar were
+# both tried and reverted - see gui.py history/README - reconfiguring
+# widget geometry on every pixel of drag/resize motion made customtkinter's
+# canvas redraw fall behind and leave visible artifacts on screen.
 SIDEBAR_LABEL_WRAP = 230
-TRACK_LABEL_WRAP = 420
 
 
 class _HoverRow(ctk.CTkFrame):
@@ -125,51 +129,134 @@ class StationRow(_HoverRow):
         self.set_state("selected" if selected else "normal")
 
 
-class TrackRow(_HoverRow):
-    def __init__(self, master, track: Track, on_play):
+class TrackListView(ttk.Frame):
+    """The track list, backed by a native ttk.Treeview instead of one
+    CTkFrame-based row per track.
+
+    A CTkFrame/CTkLabel/CTkButton row per track was the original design,
+    but creating a few thousand of them synchronously (a real HOI4 library
+    can run 2000-3000+ tracks) reliably froze the whole app - Windows
+    reported it as "Not Responding" and it never recovered, which is
+    exactly what looks like a crash to a user. ttk.Treeview is a real
+    virtualized widget (implemented natively in Tk, not built out of our
+    own child widgets): it only ever draws the rows currently in the
+    visible viewport no matter how many items it holds, so it stays fast
+    and responsive at any list size without needing any manual lazy
+    creation, pagination, or eviction scheme."""
+
+    ROW_HEIGHT = 34
+    ICON_SIZE = 22
+
+    def __init__(self, master, on_play):
         super().__init__(master)
-        self.track = track
+        self.on_play = on_play
+        self.tracks: list[Track] = []
+        self._path_to_iid: dict[Path, str] = {}
 
-        self.grid_columnconfigure(1, weight=3)
-        self.grid_columnconfigure(2, weight=2)
+        self._configure_style()
 
-        icon_label = ctk.CTkLabel(
-            self, text="", image=get_icon_image(track.mod_icon, TRACK_ICON_SIZE)
+        columns = ("station", "mod", "author", "duration")
+        self.tree = ttk.Treeview(
+            self, columns=columns, show="tree headings",
+            style="Tracks.Treeview", selectmode="browse",
         )
-        icon_label.grid(row=0, column=0, rowspan=2, padx=(8, 10), pady=8)
+        self.tree.heading("#0", text="Track", anchor="w")
+        self.tree.heading("station", text="Station", anchor="w")
+        self.tree.heading("mod", text="Mod", anchor="w")
+        self.tree.heading("author", text="Author", anchor="w")
+        self.tree.heading("duration", text="Time", anchor="e")
+        self.tree.column("#0", width=320, minwidth=160, anchor="w", stretch=True)
+        self.tree.column("station", width=150, minwidth=80, anchor="w", stretch=False)
+        self.tree.column("mod", width=170, minwidth=80, anchor="w", stretch=False)
+        self.tree.column("author", width=130, minwidth=60, anchor="w", stretch=False)
+        self.tree.column("duration", width=60, minwidth=50, anchor="e", stretch=False)
+        self.tree.tag_configure("playing", background=theme.BG_ROW_PLAYING)
 
-        title_label = ctk.CTkLabel(
-            self, text=track.display_name, anchor="w", text_color=theme.TEXT_PRIMARY,
-            font=ctk.CTkFont(weight="bold"), wraplength=TRACK_LABEL_WRAP, justify="left",
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Tracks.Vertical.TScrollbar")
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-Button-1>", self._on_double_click)
+        self.tree.bind("<Return>", self._on_enter_key)
+
+    def _configure_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")  # only "clam" honors full color overrides on Windows
+        except Exception:
+            pass
+        style.configure(
+            "Tracks.Treeview",
+            background=theme.BG_ROW, fieldbackground=theme.BG_ROW,
+            foreground=theme.TEXT_PRIMARY, borderwidth=0,
+            rowheight=self.ROW_HEIGHT, font=("Segoe UI", 10),
         )
-        title_label.grid(row=0, column=1, sticky="ew", pady=(8, 0))
-
-        mod_label = ctk.CTkLabel(
-            self, text=f"{track.mod_name}  •  {track.mod_author}", anchor="w",
-            font=ctk.CTkFont(size=11), text_color=theme.TEXT_SECONDARY,
-            wraplength=TRACK_LABEL_WRAP, justify="left",
+        style.map(
+            "Tracks.Treeview",
+            background=[("selected", theme.BG_ROW_SELECTED)],
+            foreground=[("selected", theme.TEXT_PRIMARY)],
         )
-        mod_label.grid(row=1, column=1, sticky="ew", pady=(0, 8))
-
-        duration_label = ctk.CTkLabel(
-            self, text=format_time(track.duration), anchor="e", width=50,
-            text_color=theme.TEXT_SECONDARY,
+        style.configure(
+            "Tracks.Treeview.Heading",
+            background=theme.BG_TOPBAR, foreground=theme.TEXT_SECONDARY,
+            borderwidth=0, relief="flat", font=("Segoe UI", 9, "bold"),
         )
-        duration_label.grid(row=0, column=2, rowspan=2, sticky="e", padx=(0, 12))
-
-        play_btn = ctk.CTkButton(
-            self, text="", image=play_icon(16, theme.ACCENT_TEXT), width=32, height=32,
-            corner_radius=6, fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
-            command=lambda: on_play(track),
+        style.map("Tracks.Treeview.Heading", background=[("active", theme.BG_TOPBAR)])
+        style.configure(
+            "Tracks.Vertical.TScrollbar",
+            background=theme.BUTTON_NEUTRAL, troughcolor=theme.BG_PANEL,
+            bordercolor=theme.BG_PANEL, arrowcolor=theme.TEXT_SECONDARY,
         )
-        play_btn.grid(row=0, column=3, rowspan=2, padx=(0, 10))
 
-        for widget in (self, icon_label, title_label, mod_label, duration_label):
-            widget.bind("<Double-Button-1>", lambda e: on_play(track))
-            self._bind_hover(widget)
+    def set_tracks(self, tracks: list[Track], playing_path: Optional[Path]):
+        self.tree.delete(*self.tree.get_children())
+        self.tracks = tracks
+        self._path_to_iid = {}
+        for i, track in enumerate(tracks):
+            iid = str(i)
+            icon = get_icon_photo(track.mod_icon, self.ICON_SIZE)
+            playing = playing_path is not None and track.file_path == playing_path
+            self.tree.insert(
+                "", "end", iid=iid, text=f" {track.display_name}", image=icon,
+                values=(track.station_name, track.mod_name, track.mod_author, format_time(track.duration)),
+                tags=("playing",) if playing else (),
+            )
+            self._path_to_iid[track.file_path] = iid
+        if playing_path is not None and playing_path in self._path_to_iid:
+            self.tree.see(self._path_to_iid[playing_path])
 
-    def set_playing(self, playing: bool):
-        self.set_state("playing" if playing else "normal")
+    def set_playing(self, playing_path: Optional[Path]):
+        for iid in self.tree.tag_has("playing"):
+            self.tree.item(iid, tags=())
+        if playing_path is None:
+            return
+        iid = self._path_to_iid.get(playing_path)
+        if iid is not None:
+            self.tree.item(iid, tags=("playing",))
+            self.tree.see(iid)
+
+    def update_track_duration(self, track: Track):
+        iid = self._path_to_iid.get(track.file_path)
+        if iid is not None:
+            self.tree.set(iid, "duration", format_time(track.duration))
+
+    def _on_double_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self._play_iid(iid)
+
+    def _on_enter_key(self, _event):
+        selection = self.tree.selection()
+        if selection:
+            self._play_iid(selection[0])
+
+    def _play_iid(self, iid: str):
+        index = int(iid)
+        if 0 <= index < len(self.tracks):
+            self.on_play(self.tracks[index])
 
 
 def _styled_button(master, **kwargs):
@@ -259,7 +346,6 @@ class App(ctk.CTk):
 
         self.stations: list[Station] = []
         self.station_rows: dict[str, StationRow] = {}
-        self.track_rows: list[TrackRow] = []
         self.selected_station_key: Optional[str] = None
         self.current_display_tracks: list[Track] = []
         self._scanning = False
@@ -372,8 +458,17 @@ class App(ctk.CTk):
             command=self._play_all,
         ).pack(side="right")
 
-        self.tracks_scroll = ctk.CTkScrollableFrame(track_panel, fg_color="transparent", label_text="")
-        self.tracks_scroll.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self.track_list_view = TrackListView(track_panel, on_play=self._play_track)
+        self.track_list_view.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+
+        self.empty_tracks_label = ctk.CTkLabel(
+            track_panel,
+            text="No tracks to show. Add folders with HOI4 music mods, "
+                 "or adjust your search/filters.",
+            wraplength=520, justify="left", text_color=theme.TEXT_SECONDARY,
+        )
+        self.empty_tracks_label.grid(row=1, column=0, sticky="nw", padx=14, pady=(4, 14))
+        self.empty_tracks_label.grid_remove()
 
         # Now playing bar
         self._build_now_playing_bar()
@@ -502,10 +597,9 @@ class App(ctk.CTk):
         batch, self._duration_backlog = self._duration_backlog[:5], self._duration_backlog[5:]
         for track in batch:
             compute_track_duration(track)
+            self.track_list_view.update_track_duration(track)
         if self._duration_backlog:
             self.after(15, self._process_duration_backlog)
-        else:
-            self._refresh_track_list()
 
     def _open_folder_manager(self):
         FolderManagerDialog(self, self.config_store, on_change=self.rescan)
@@ -569,10 +663,6 @@ class App(ctk.CTk):
         return enabled_stations
 
     def _refresh_track_list(self):
-        for child in self.tracks_scroll.winfo_children():
-            child.destroy()
-        self.track_rows.clear()
-
         query = self.search_var.get().strip().lower()
         tracks: list[Track] = []
         for station in self._visible_stations():
@@ -591,20 +681,16 @@ class App(ctk.CTk):
         self.track_count_label.configure(text=f"Tracks ({len(tracks)})")
 
         current = self.player.current_track
+        current_path = current.file_path if current is not None else None
         if not tracks:
-            ctk.CTkLabel(
-                self.tracks_scroll,
-                text="No tracks to show. Add folders with HOI4 music mods, "
-                     "or adjust your search/filters.",
-                wraplength=520, justify="left", text_color=theme.TEXT_SECONDARY,
-            ).pack(pady=16, padx=8, anchor="w")
+            self.track_list_view.set_tracks([], None)
+            self.track_list_view.grid_remove()
+            self.empty_tracks_label.grid()
             return
 
-        for track in tracks:
-            row = TrackRow(self.tracks_scroll, track, on_play=self._play_track)
-            row.pack(fill="x", pady=3)
-            row.set_playing(current is not None and current.file_path == track.file_path)
-            self.track_rows.append(row)
+        self.empty_tracks_label.grid_remove()
+        self.track_list_view.grid()
+        self.track_list_view.set_tracks(tracks, current_path)
 
     def _play_all(self):
         if not self.current_display_tracks:
@@ -646,8 +732,7 @@ class App(ctk.CTk):
                 # Small delay so this never competes with the audio engine
                 # actually starting playback; runs on the main thread.
                 self.after(30, lambda t=track: self._maybe_fetch_duration(t))
-        for row in self.track_rows:
-            row.set_playing(track is not None and row.track.file_path == track.file_path)
+        self.track_list_view.set_playing(track.file_path if track is not None else None)
 
     def _maybe_fetch_duration(self, track: Track):
         if self.player.current_track is not track:
