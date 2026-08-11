@@ -50,9 +50,10 @@ file); otherwise it shows as "Unknown".
 - Browse tracks by radio station, or across "All Stations" at once
 - Enable/disable individual stations — disabled stations' tracks never show up or play
 - Search by track title, station name, mod name, or author
-- Play / pause / previous / next, volume control
+- Play / pause / previous / next, volume control, click/drag the progress bar to seek
 - Shows each track's real duration (read in the background after scanning)
 - Mod icon shown per track and in the now-playing bar
+- English/Russian UI, and prefers a mod's Russian localisation for track/station names when available (falls back to English per-key if a translation is missing)
 
 ## Download
 

@@ -30,6 +30,12 @@ class PlayerEngine:
         self.shuffle: bool = False
         self.repeat: RepeatMode = RepeatMode.OFF
         self._paused: bool = False
+        # pygame.mixer.music.get_pos() returns milliseconds since play() was
+        # called and does NOT reset on set_pos() (seeking) - so position has
+        # to be tracked as an offset from the last play()/seek() reference
+        # point, not read directly from get_pos().
+        self._position_base_seconds: float = 0.0
+        self._position_base_ticks_ms: int = 0
 
         self.on_track_change: Optional[Callable[[Optional[Track]], None]] = None
         self.on_playback_state_change: Optional[Callable[[bool], None]] = None
@@ -96,6 +102,8 @@ class PlayerEngine:
         pygame.mixer.music.set_volume(self.volume * track.volume)
         pygame.mixer.music.play()
         self._paused = False
+        self._position_base_seconds = 0.0
+        self._position_base_ticks_ms = pygame.mixer.music.get_pos()
         if self.on_track_change:
             self.on_track_change(track)
         if self.on_playback_state_change:
@@ -169,13 +177,34 @@ class PlayerEngine:
         track_scale = track.volume if track else 1.0
         pygame.mixer.music.set_volume(self.volume * track_scale)
 
+    def seek(self, seconds: float) -> bool:
+        """Jump to a position in the current track. Returns False if the
+        format doesn't support seeking (pygame/SDL_mixer only supports
+        set_pos() for OGG and MP3 - not WAV) rather than raising."""
+        track = self.current_track
+        if track is None:
+            return False
+        seconds = max(0.0, seconds)
+        was_paused = self._paused
+        try:
+            pygame.mixer.music.set_pos(seconds)
+        except pygame.error:
+            return False
+        if was_paused:
+            # set_pos() on some backends resumes playback - restore pause.
+            pygame.mixer.music.pause()
+        self._position_base_seconds = seconds
+        self._position_base_ticks_ms = pygame.mixer.music.get_pos()
+        return True
+
     def get_position_seconds(self) -> float:
         if self.current_track is None:
             return 0.0
         pos_ms = pygame.mixer.music.get_pos()
         if pos_ms < 0:
-            return 0.0
-        return pos_ms / 1000.0
+            return self._position_base_seconds
+        elapsed = (pos_ms - self._position_base_ticks_ms) / 1000.0
+        return max(0.0, self._position_base_seconds + elapsed)
 
     def get_duration_seconds(self) -> Optional[float]:
         track = self.current_track

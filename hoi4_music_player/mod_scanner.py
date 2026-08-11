@@ -41,6 +41,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from .i18n import HOI4_LANGUAGE_TAG
 from .models import Station, Track
 
 AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav"}
@@ -171,23 +172,31 @@ def _unescape(value: str) -> str:
     return value.replace('\\"', '"').replace("\\n", "\n")
 
 
-def parse_localisation(mod_root: Path) -> dict[str, str]:
-    """Parse every localisation/**/*.yml file and return song_key -> title.
-    Prefers English localisation when a key is defined in multiple languages."""
-    loc_dir = mod_root / "localisation"
+def parse_localisation(content_root: Path, language: str = "en") -> dict[str, str]:
+    """Parse every localisation/**/*.yml file and return song/station key ->
+    display text, preferring `language` (falling back to English, then to
+    whatever else is available, per key - not per file - so a mod that's
+    only partially translated doesn't lose the untranslated entries)."""
+    loc_dir = content_root / "localisation"
     if not loc_dir.is_dir():
         return {}
 
+    preferred_tag = HOI4_LANGUAGE_TAG.get(language, "l_english")
+
+    def priority(path: Path) -> int:
+        if preferred_tag in path.name:
+            return 2
+        if "l_english" in path.name:
+            return 1
+        return 0
+
+    # Ascending priority order: each subsequent file's keys overwrite
+    # earlier ones, so the highest-priority source available for a given
+    # key always wins, independently per key.
+    yml_files = sorted(loc_dir.rglob("*.yml"), key=priority)
+
     result: dict[str, str] = {}
-    english_keys: set[str] = set()
-
-    yml_files = sorted(loc_dir.rglob("*.yml"))
-    # Process english files last so they take priority (except keys already
-    # marked as coming from an english file, which always win).
-    yml_files.sort(key=lambda p: 0 if "l_english" in p.name else 1)
-
     for yml_path in yml_files:
-        is_english = "l_english" in yml_path.name
         try:
             text = yml_path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
@@ -199,13 +208,7 @@ def parse_localisation(mod_root: Path) -> dict[str, str]:
             if not match:
                 continue
             key, value = match.group(1), match.group(2)
-            if key in english_keys:
-                continue
-            if key in result and not is_english:
-                continue
             result[key] = _unescape(value)
-            if is_english:
-                english_keys.add(key)
     return result
 
 
@@ -278,11 +281,21 @@ def parse_song_definitions(content_root: Path) -> dict[str, dict]:
     return definitions
 
 
+_STATION_DECL_RE = re.compile(r'music_station\s*=\s*"?([A-Za-z0-9_\-\.]+)"?')
+
+
 def parse_station_assignments(content_root: Path) -> dict[str, list[str]]:
     """Station ASSIGNMENTS: `*.txt` files under music/ that declare
-    `music_station = "station_key"` once, followed by `music = { song =
-    "KEY" chance = {...} }` blocks referencing songs by the name they were
-    given in a .asset file. Returns station_key -> [song_key, ...]."""
+    `music_station = "station_key"`, followed by `music = { song = "KEY"
+    chance = {...} }` blocks referencing songs by the name they were given
+    in a .asset file. Returns station_key -> [song_key, ...].
+
+    Handles a file declaring `music_station` more than once (some mods
+    assign several stations from a single file) by treating each
+    declaration as starting a new segment that runs until the next
+    declaration - everything between them belongs to that station. Also
+    accepts an unquoted station key (`music_station = gunka`), since not
+    every mod follows the quoted-string convention from the wiki example."""
     music_dir = content_root / "music"
     assignments: dict[str, list[str]] = {}
     if not music_dir.is_dir():
@@ -294,25 +307,35 @@ def parse_station_assignments(content_root: Path) -> dict[str, list[str]]:
         except OSError:
             continue
         text = _strip_comments(text)
-        station_match = re.search(r'music_station\s*=\s*"([^"]*)"', text)
-        if not station_match:
+        declarations = list(_STATION_DECL_RE.finditer(text))
+        if not declarations:
             continue
-        station_key = station_match.group(1)
-        song_keys = [
-            m.group(1)
-            for block in _find_blocks(text, "music")
-            for m in [re.search(r'song\s*=\s*"([^"]*)"', block)]
-            if m
-        ]
-        if song_keys:
-            assignments.setdefault(station_key, []).extend(song_keys)
+        for i, decl in enumerate(declarations):
+            station_key = decl.group(1)
+            segment_end = declarations[i + 1].start() if i + 1 < len(declarations) else len(text)
+            segment = text[decl.end():segment_end]
+            song_keys = [
+                m.group(1)
+                for block in _find_blocks(segment, "music")
+                for m in [re.search(r'song\s*=\s*"([^"]*)"', block)]
+                if m
+            ]
+            if song_keys:
+                assignments.setdefault(station_key, []).extend(song_keys)
     return assignments
 
 
 def _station_display_name(localisation: dict[str, str], station_key: str) -> str:
-    for candidate in (f"{station_key}_TITLE", station_key):
+    for candidate in (f"{station_key}_TITLE", station_key, f"{station_key}_NAME"):
         if candidate in localisation:
             return localisation[candidate]
+    # Case-insensitive fallback - some mods aren't consistent about casing
+    # between the station key and its localisation entry.
+    lower_key = station_key.lower()
+    wanted = {f"{lower_key}_title", lower_key, f"{lower_key}_name"}
+    for loc_key, value in localisation.items():
+        if loc_key.lower() in wanted:
+            return value
     return station_key.replace("_", " ").replace("-", " ").strip().title() or station_key
 
 
@@ -349,7 +372,7 @@ def _resolve_mod_icon(descriptor: dict, descriptor_path: Path, content_root: Pat
     return None
 
 
-def load_stations(descriptor_path: Path, content_root: Path) -> list[Station]:
+def load_stations(descriptor_path: Path, content_root: Path, language: str = "en") -> list[Station]:
     """Build every Station for one mod: real stations from music_station
     assignments, plus a fallback station (named after the mod) for any
     defined songs that were never assigned to a station."""
@@ -359,7 +382,7 @@ def load_stations(descriptor_path: Path, content_root: Path) -> list[Station]:
     icon = _resolve_mod_icon(descriptor, descriptor_path, content_root)
     mod_id = str(content_root.resolve())
 
-    localisation = parse_localisation(content_root)
+    localisation = parse_localisation(content_root, language)
     definitions = parse_song_definitions(content_root)
     assignments = parse_station_assignments(content_root)
     file_index = _build_music_file_index(content_root)
@@ -431,7 +454,7 @@ def load_stations(descriptor_path: Path, content_root: Path) -> list[Station]:
     return stations
 
 
-def scan_folders_detailed(folders: list[Path]) -> tuple[list[Station], list[str]]:
+def scan_folders_detailed(folders: list[Path], language: str = "en") -> tuple[list[Station], list[str]]:
     """Like scan_folders, but also reports mods that were found (had a valid
     descriptor) but contributed zero stations/tracks - useful for telling
     "nothing detected at all" apart from "found your mod, but couldn't
@@ -443,7 +466,7 @@ def scan_folders_detailed(folders: list[Path]) -> tuple[list[Station], list[str]
         if not folder.is_dir():
             continue
         for descriptor_path, content_root in find_mod_entries(folder):
-            stations = load_stations(descriptor_path, content_root)
+            stations = load_stations(descriptor_path, content_root, language)
             if not stations:
                 descriptor = parse_descriptor(descriptor_path)
                 empty_mod_names.append(descriptor.get("name", content_root.name).strip() or content_root.name)
@@ -454,8 +477,8 @@ def scan_folders_detailed(folders: list[Path]) -> tuple[list[Station], list[str]
     return result, empty_mod_names
 
 
-def scan_folders(folders: list[Path]) -> list[Station]:
+def scan_folders(folders: list[Path], language: str = "en") -> list[Station]:
     """Scan every supplied folder for HOI4 music mods and return every
     Station found (deduplicated by station key)."""
-    stations, _empty = scan_folders_detailed(folders)
+    stations, _empty = scan_folders_detailed(folders, language)
     return stations

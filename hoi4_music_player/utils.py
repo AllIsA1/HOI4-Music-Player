@@ -26,7 +26,14 @@ _ICON_FG = (201, 162, 39, 255)
 
 
 def _make_default_icon(size: int) -> Image.Image:
-    scale = 4
+    # Supersample well past the target size, then downsample with LANCZOS -
+    # but the stroke widths below are computed in FINAL-size units first and
+    # only then scaled up, so they never shrink below ~2 final pixels. That
+    # matters more than the supersampling factor: a sub-pixel-wide stroke
+    # (e.g. the note stem) looks soft/blurry once resampled down regardless
+    # of how much supersampling was used, since there's nothing crisp left
+    # to preserve.
+    scale = 8 if size <= 32 else 4
     s = size * scale
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -35,11 +42,11 @@ def _make_default_icon(size: int) -> Image.Image:
     cx, cy = s * 0.42, s * 0.58
     r = s * 0.14
     draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_ICON_FG)
-    stem_w = max(2, s // 16)
-    draw.rectangle([cx + r - stem_w, s * 0.18, cx + r, cy], fill=_ICON_FG)
+    stem_w = max(2, round(size * 0.09)) * scale
+    draw.rectangle([cx + r - stem_w, s * 0.16, cx + r, cy], fill=_ICON_FG)
     flag_pts = [
-        (cx + r - stem_w, s * 0.18),
-        (cx + r + s * 0.16, s * 0.28),
+        (cx + r - stem_w, s * 0.16),
+        (cx + r + s * 0.18, s * 0.27),
         (cx + r - stem_w, s * 0.38),
     ]
     draw.polygon(flag_pts, fill=_ICON_FG)
@@ -54,15 +61,31 @@ def get_app_icon_image(size: int = 64) -> Image.Image:
     return _make_default_icon(size)
 
 
+_ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+
 def get_app_icon_ico_path() -> Path:
-    """Writes (once per run) a multi-resolution .ico of the app icon to a
-    temp file and returns its path, for Tk's Windows-only iconbitmap()."""
+    """Writes a multi-resolution .ico of the app icon to a temp file and
+    returns its path, for Tk's Windows-only iconbitmap(). Each size is
+    rendered independently (see _make_default_icon) and embedded directly,
+    rather than saving one large image and letting the ICO encoder
+    downscale it for the smaller sizes - Pillow's own resize for that step
+    produced a visibly soft/blurry small icon."""
     tmp_dir = Path(tempfile.gettempdir()) / "hoi4_music_player"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     ico_path = tmp_dir / "app_icon.ico"
-    if not ico_path.exists():
-        img = _make_default_icon(256)
-        img.save(ico_path, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    images = [_make_default_icon(size) for size in _ICO_SIZES]
+    # Pillow's ICO writer skips any requested size larger than the primary
+    # image passed to save() - so the primary has to be the LARGEST one
+    # (256px) for every other independently-rendered size in append_images
+    # to actually get embedded via its exact-size match, instead of being
+    # silently dropped.
+    images.sort(key=lambda im: im.size)
+    images[-1].save(
+        ico_path, format="ICO",
+        sizes=[(size, size) for size in _ICO_SIZES],
+        append_images=images[:-1],
+    )
     return ico_path
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .i18n import DEFAULT_LANGUAGE, LANGUAGES
+
 CONFIG_DIR = Path.home() / ".hoi4_music_player"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
@@ -11,6 +13,7 @@ DEFAULTS = {
     "folders": [],
     "disabled_station_keys": [],
     "volume": 0.7,
+    "language": DEFAULT_LANGUAGE,
 }
 
 
@@ -77,4 +80,13 @@ class Config:
     @volume.setter
     def volume(self, value: float) -> None:
         self.data["volume"] = max(0.0, min(1.0, value))
+        self.save()
+
+    @property
+    def language(self) -> str:
+        return self.data["language"]
+
+    @language.setter
+    def language(self, value: str) -> None:
+        self.data["language"] = value if value in LANGUAGES else DEFAULT_LANGUAGE
         self.save()
