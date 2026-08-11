@@ -1,0 +1,5 @@
+music = {
+	song = "LOCAL_SONG_ONE"
+	file = "music/local_song.wav"
+	volume = 0.60
+}

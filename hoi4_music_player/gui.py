@@ -20,7 +20,7 @@ from .icons import (
     refresh_icon,
     volume_icon,
 )
-from .mod_scanner import scan_folders
+from .mod_scanner import scan_folders_detailed
 from .models import Mod, Track
 from .player_engine import PlayerEngine
 from .utils import format_time, get_icon_image
@@ -442,19 +442,27 @@ class App(ctk.CTk):
         self.status_label.configure(text="Scanning…")
 
         def work():
-            mods = scan_folders([Path(f) for f in folders])
-            self.after(0, lambda: self._on_scan_complete(mods))
+            mods, empty_mod_names = scan_folders_detailed([Path(f) for f in folders])
+            self.after(0, lambda: self._on_scan_complete(mods, empty_mod_names))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_scan_complete(self, mods: list[Mod]):
+    def _on_scan_complete(self, mods: list[Mod], empty_mod_names: list[str] = ()):
         self._scanning = False
         self.mods = mods
         total_tracks = sum(m.track_count for m in mods)
         if mods:
-            self.status_label.configure(text=f"{len(mods)} mods, {total_tracks} tracks")
+            status = f"{len(mods)} mods, {total_tracks} tracks"
+            if empty_mod_names:
+                status += f" ({len(empty_mod_names)} more found with no music/ tracks)"
+            self.status_label.configure(text=status)
+        elif empty_mod_names:
+            names = ", ".join(empty_mod_names[:3])
+            if len(empty_mod_names) > 3:
+                names += f", +{len(empty_mod_names) - 3} more"
+            self.status_label.configure(text=f"Found mod(s) ({names}) but no tracks in their music/ folder")
         elif self.config_store.folders:
-            self.status_label.configure(text="No music mods found in the added folders")
+            self.status_label.configure(text="No .mod/descriptor.mod found in the added folders")
         self._rebuild_mod_list()
         self._refresh_track_list()
 

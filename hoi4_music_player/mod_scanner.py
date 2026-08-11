@@ -2,12 +2,25 @@
 Scans user-supplied folders for Hearts of Iron IV mods and extracts music
 track metadata straight from the real mod file structure:
 
-    <mod_root>/descriptor.mod          -> mod name / author / thumbnail
-    <mod_root>/music/**/*.txt          -> music = { song = "..." file = "..." volume = ... }
-    <mod_root>/localisation/**/*.yml   -> localisation of song keys -> display titles
+    <content_root>/music/**/*.txt          -> music = { song = "..." file = "..." volume = ... }
+    <content_root>/localisation/**/*.yml   -> localisation of song keys -> display titles
 
 No extra/custom config files are required or read. This mirrors the format
 Paradox and mod authors actually ship music mods in.
+
+HOI4 mods are installed on disk in one of two real layouts, and both are
+supported here:
+
+  - Steam Workshop: the descriptor sits INSIDE the mod's own folder, named
+    exactly `descriptor.mod`:
+        <content_root>/descriptor.mod
+        <content_root>/music/...
+
+  - Local/manual installs (Documents/Paradox Interactive/Hearts of Iron IV/mod/):
+    the descriptor is a SEPARATE sibling file with an arbitrary name, which
+    points at the actual content folder via its `path=` field:
+        mod/my_music_mod.mod        (descriptor; path="mod/my_music_mod")
+        mod/my_music_mod/music/...  (content, referenced by path=)
 """
 from __future__ import annotations
 
@@ -71,35 +84,65 @@ def _parse_flat_keyvals(text: str) -> dict[str, str]:
     return result
 
 
-def find_mod_roots(base_dir: Path) -> list[Path]:
-    """Find every mod root under base_dir. A mod root is any directory that
-    directly contains a descriptor.mod file. base_dir itself is checked first
-    (flat mod folder), then subdirectories are searched recursively up to a
-    depth limit (covers Steam Workshop layouts like content/<appid>/<id>/)."""
-    base_dir = Path(base_dir)
-    roots: list[Path] = []
+def _resolve_local_mod_content_root(mod_file: Path, path_value: str) -> Optional[Path]:
+    """Resolve a standalone `<name>.mod` descriptor's `path=` field to the
+    actual content folder. In practice that folder is always a sibling of
+    the .mod file itself (e.g. mod/my_mod.mod + mod/my_mod/), regardless of
+    whether path= is "mod/my_mod", "my_mod", or uses backslashes."""
+    if not path_value:
+        return None
+    normalized = path_value.replace("\\", "/").strip().rstrip("/")
+    folder_name = normalized.rsplit("/", 1)[-1]
+    if not folder_name:
+        return None
+    candidate = mod_file.parent / folder_name
+    return candidate if candidate.is_dir() else None
 
-    if (base_dir / "descriptor.mod").is_file():
-        roots.append(base_dir)
-        return roots
+
+def find_mod_entries(base_dir: Path) -> list[tuple[Path, Path]]:
+    """Find every mod under base_dir. Returns (descriptor_path, content_root)
+    pairs, covering both the Steam Workshop layout (descriptor.mod inside the
+    mod's own folder) and the local/manual-install layout (a standalone
+    <name>.mod sitting next to a sibling content folder). Searched
+    recursively up to a depth limit, so pointing this at a Steam Workshop
+    content/<appid>/ folder or a HOI4 mod/ folder both work."""
+    base_dir = Path(base_dir)
+    entries: list[tuple[Path, Path]] = []
+    seen_content_roots: set[Path] = set()
+
+    def _add(descriptor_path: Path, content_root: Path):
+        resolved = content_root.resolve()
+        if resolved not in seen_content_roots:
+            seen_content_roots.add(resolved)
+            entries.append((descriptor_path, content_root))
 
     def _walk(directory: Path, depth: int):
-        if depth > MAX_DESCRIPTOR_SEARCH_DEPTH:
+        workshop_descriptor = directory / "descriptor.mod"
+        if workshop_descriptor.is_file():
+            _add(workshop_descriptor, directory)
+            return  # a mod's own content folder isn't searched for more mods
+
+        try:
+            loose_mod_files = [p for p in directory.glob("*.mod") if p.is_file()]
+        except OSError:
+            loose_mod_files = []
+        for mod_file in loose_mod_files:
+            descriptor = parse_descriptor(mod_file)
+            content_root = _resolve_local_mod_content_root(mod_file, descriptor.get("path", ""))
+            if content_root is not None:
+                _add(mod_file, content_root)
+
+        if depth >= MAX_DESCRIPTOR_SEARCH_DEPTH:
             return
         try:
-            entries = list(directory.iterdir())
+            subdirs = [p for p in directory.iterdir() if p.is_dir()]
         except OSError:
             return
-        for entry in entries:
-            if not entry.is_dir():
-                continue
-            if (entry / "descriptor.mod").is_file():
-                roots.append(entry)
-            else:
-                _walk(entry, depth + 1)
+        for subdir in subdirs:
+            _walk(subdir, depth + 1)
 
     _walk(base_dir, 0)
-    return roots
+    return entries
 
 
 def parse_descriptor(descriptor_path: Path) -> dict:
@@ -218,39 +261,37 @@ def _guess_author(descriptor: dict, mod_root: Path) -> str:
     return "Unknown"
 
 
-def load_mod(mod_root: Path) -> Optional[Mod]:
-    descriptor_path = mod_root / "descriptor.mod"
-    if not descriptor_path.is_file():
-        return None
-
+def load_mod(descriptor_path: Path, content_root: Path) -> Optional[Mod]:
     descriptor = parse_descriptor(descriptor_path)
-    name = descriptor.get("name", mod_root.name).strip() or mod_root.name
-    author = _guess_author(descriptor, mod_root)
+    name = descriptor.get("name", content_root.name).strip() or content_root.name
+    author = _guess_author(descriptor, content_root)
 
     icon: Optional[Path] = None
     picture_name = descriptor.get("picture")
     if picture_name:
-        candidate = mod_root / picture_name
-        if candidate.is_file():
-            icon = candidate
+        for base in (content_root, descriptor_path.parent):
+            candidate = base / picture_name
+            if candidate.is_file():
+                icon = candidate
+                break
     if icon is None:
         for fallback in ("thumbnail.png", "thumbnail.jpg"):
-            candidate = mod_root / fallback
+            candidate = content_root / fallback
             if candidate.is_file():
                 icon = candidate
                 break
 
-    localisation = parse_localisation(mod_root)
-    raw_tracks = parse_music_tracks(mod_root)
+    localisation = parse_localisation(content_root)
+    raw_tracks = parse_music_tracks(content_root)
     if not raw_tracks:
         return None
 
-    mod_id = str(mod_root.resolve())
-    mod = Mod(mod_id=mod_id, name=name, author=author, root=mod_root, icon=icon)
+    mod_id = str(content_root.resolve())
+    mod = Mod(mod_id=mod_id, name=name, author=author, root=content_root, icon=icon)
 
     seen_files: set[str] = set()
     for raw in raw_tracks:
-        resolved = _resolve_audio_path(mod_root, raw["file"])
+        resolved = _resolve_audio_path(content_root, raw["file"])
         if resolved is None:
             continue
         if resolved.suffix.lower() not in AUDIO_EXTENSIONS:
@@ -281,17 +322,30 @@ def load_mod(mod_root: Path) -> Optional[Mod]:
     return mod
 
 
-def scan_folders(folders: list[Path]) -> list[Mod]:
-    """Scan every supplied folder for HOI4 music mods and return a list of
-    Mod objects (deduplicated by resolved mod root)."""
+def scan_folders_detailed(folders: list[Path]) -> tuple[list[Mod], list[str]]:
+    """Like scan_folders, but also reports mods that were found (had a valid
+    descriptor) but contributed zero tracks - useful for telling "nothing
+    detected at all" apart from "found your mod, but couldn't parse its
+    music/ files", which otherwise look identical to the user."""
     mods_by_id: dict[str, Mod] = {}
+    empty_mod_names: list[str] = []
     for folder in folders:
         folder = Path(folder)
         if not folder.is_dir():
             continue
-        for mod_root in find_mod_roots(folder):
-            mod = load_mod(mod_root)
+        for descriptor_path, content_root in find_mod_entries(folder):
+            mod = load_mod(descriptor_path, content_root)
             if mod is None:
+                descriptor = parse_descriptor(descriptor_path)
+                empty_mod_names.append(descriptor.get("name", content_root.name).strip() or content_root.name)
                 continue
             mods_by_id[mod.mod_id] = mod
-    return sorted(mods_by_id.values(), key=lambda m: m.name.lower())
+    mods = sorted(mods_by_id.values(), key=lambda m: m.name.lower())
+    return mods, empty_mod_names
+
+
+def scan_folders(folders: list[Path]) -> list[Mod]:
+    """Scan every supplied folder for HOI4 music mods and return a list of
+    Mod objects (deduplicated by resolved content root)."""
+    mods, _empty = scan_folders_detailed(folders)
+    return mods
