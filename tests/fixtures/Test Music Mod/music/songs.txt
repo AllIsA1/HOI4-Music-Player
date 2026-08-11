@@ -1,0 +1,15 @@
+music = {
+	song = "TEST_SONG_ONE"
+	file = "music/song_one.wav"
+	volume = 0.60
+}
+music = {
+	song = "TEST_SONG_TWO"
+	file = "music/song_two.wav"
+	volume = 0.75
+	chance = {
+		modifier = {
+			factor = 1
+		}
+	}
+}
