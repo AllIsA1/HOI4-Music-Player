@@ -73,8 +73,46 @@ def test_scan_finds_real_asset_and_station_format():
 def test_scan_finds_all_fixture_layouts_together():
     stations = scan_folders([FIXTURES_DIR])
     names = sorted(s.name for s in stations)
-    assert names == ["Gunka", "My Local Mod", "Test Music Mod", "Utagoe"], names
-    print("OK: scanning the whole fixtures dir finds every layout:", names)
+    # The Nightcore fixture only ships Russian localisation, so its station
+    # names come through in Russian even with the default "en" language -
+    # there's nothing English to fall back to for those specific keys.
+    assert names == [
+        "Gunka", "My Local Mod", "Nightcore Radio 2", "Test Music Mod",
+        "Utagoe", 'Радио "Nightcore"',
+    ], names
+    print("OK: scanning the whole fixtures dir finds every layout (names count):", len(names))
+
+
+def test_scan_handles_multi_station_file_and_per_track_icons():
+    """Modeled on a real published mod: two `music_station = ...` declarations
+    in ONE .txt file (one quoted, one not), plus a title localisation that
+    embeds a per-track album art reference as `...\\n\\n£GFX_sprite\\n\\n...`
+    (see hoi4.paradoxwikis.com's £icon text syntax) resolved via an
+    interface/*.gfx spriteType. Both station splitting and per-track icons
+    must work for this real-world case, not just the wiki's clean example."""
+    stations = scan_folders([FIXTURES_DIR / "Nightcore Mod"], language="ru")
+    by_name = {s.name: s for s in stations}
+    assert set(by_name) == {'Радио "Nightcore"', "Nightcore Radio 2"}, by_name.keys()
+
+    station1 = by_name['Радио "Nightcore"']
+    assert len(station1.tracks) == 1
+    track1 = station1.tracks[0]
+    # the £ref and its padding \n's must be stripped, not shown as garbage
+    assert track1.title == "Nightcore - Dam Dadi Doo", repr(track1.title)
+    assert track1.icon is not None and track1.icon.name == "TFR_dam_dadi_doo.png"
+
+    station2 = by_name["Nightcore Radio 2"]
+    assert len(station2.tracks) == 1
+    track2 = station2.tracks[0]
+    assert track2.title == "Nightcore - Roi", repr(track2.title)
+    assert track2.icon is not None and track2.icon.name == "TFR_generic.png"
+
+    # each track's per-track icon must differ - this is what "every track
+    # in the station shows the same cover" was really about
+    assert track1.icon != track2.icon
+
+    print("OK: multi-station file split correctly, and per-track icons differ:",
+          track1.icon.name, "vs", track2.icon.name)
 
 
 if __name__ == "__main__":
@@ -82,3 +120,4 @@ if __name__ == "__main__":
     test_scan_finds_local_install_style_mod()
     test_scan_finds_real_asset_and_station_format()
     test_scan_finds_all_fixture_layouts_together()
+    test_scan_handles_multi_station_file_and_per_track_icons()

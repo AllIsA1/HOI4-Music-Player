@@ -11,6 +11,10 @@ against real published mods:
                                                music = { song = "KEY" chance = { ... } }
     <content_root>/localisation/**/*.yml   -> song titles (by KEY) and station
                                                display names (by "station_key_TITLE")
+    <content_root>/interface/**/*.gfx      -> spriteType definitions some mods
+                                               reference from a song's title text
+                                               (see _extract_icon_ref) to give each
+                                               track its own album art
 
 A song is only ever defined once (in a .asset file, by `name`/`file`), then
 referenced by `song = "KEY"` from one or more station-assignment .txt files.
@@ -172,14 +176,34 @@ def _unescape(value: str) -> str:
     return value.replace('\\"', '"').replace("\\n", "\n")
 
 
-def parse_localisation(content_root: Path, language: str = "en") -> dict[str, str]:
-    """Parse every localisation/**/*.yml file and return song/station key ->
-    display text, preferring `language` (falling back to English, then to
-    whatever else is available, per key - not per file - so a mod that's
-    only partially translated doesn't lose the untranslated entries)."""
+_ICON_REF_RE = re.compile(r"£(\S+)")
+
+
+def _extract_icon_ref(raw_text: str) -> tuple[str, Optional[str]]:
+    """HOI4's text rendering supports inline icon references via `£sprite_name`
+    embedded in localised text. Some music mods (ab)use this in a song's
+    title localisation to attach per-track album art, since the base
+    music = {} format has no dedicated field for it - the reference (and
+    the run of literal \\n's some mods pad it with) isn't part of the
+    title, so it's split out here rather than left to show up as garbage
+    in the displayed name. Returns (clean_title, sprite_name_or_None)."""
+    match = _ICON_REF_RE.search(raw_text)
+    if not match:
+        return raw_text.strip(), None
+    return raw_text[: match.start()].strip(), match.group(1)
+
+
+def parse_localisation(content_root: Path, language: str = "en") -> tuple[dict[str, str], dict[str, str]]:
+    """Parse every localisation/**/*.yml file, preferring `language`
+    (falling back to English, then to whatever else is available, per key -
+    not per file - so a mod that's only partially translated doesn't lose
+    the untranslated entries). Returns (titles, icon_refs):
+      - titles: song/station key -> display text (with any £icon_ref stripped out)
+      - icon_refs: song/station key -> sprite name, only for keys that had one
+    """
     loc_dir = content_root / "localisation"
     if not loc_dir.is_dir():
-        return {}
+        return {}, {}
 
     preferred_tag = HOI4_LANGUAGE_TAG.get(language, "l_english")
 
@@ -195,7 +219,8 @@ def parse_localisation(content_root: Path, language: str = "en") -> dict[str, st
     # key always wins, independently per key.
     yml_files = sorted(loc_dir.rglob("*.yml"), key=priority)
 
-    result: dict[str, str] = {}
+    titles: dict[str, str] = {}
+    icon_refs: dict[str, str] = {}
     for yml_path in yml_files:
         try:
             text = yml_path.read_text(encoding="utf-8-sig", errors="replace")
@@ -208,8 +233,46 @@ def parse_localisation(content_root: Path, language: str = "en") -> dict[str, st
             if not match:
                 continue
             key, value = match.group(1), match.group(2)
-            result[key] = _unescape(value)
-    return result
+            clean_title, icon_ref = _extract_icon_ref(_unescape(value))
+            titles[key] = clean_title
+            if icon_ref:
+                icon_refs[key] = icon_ref
+            else:
+                icon_refs.pop(key, None)
+    return titles, icon_refs
+
+
+def parse_sprite_textures(content_root: Path) -> dict[str, Path]:
+    """Parses interface/**/*.gfx for `spriteType = { name = "GFX_X" texturefile
+    = "gfx/..." }` definitions, resolving each sprite name to its image file.
+    Used to resolve the £sprite_name references parse_localisation extracts
+    (see _extract_icon_ref) into an actual per-track album art image."""
+    interface_dir = content_root / "interface"
+    sprites: dict[str, Path] = {}
+    if not interface_dir.is_dir():
+        return sprites
+    for gfx_path in sorted(interface_dir.rglob("*.gfx")):
+        try:
+            text = gfx_path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        text = _strip_comments(text)
+        for block in _find_blocks(text, "spriteType"):
+            name_match = re.search(r'name\s*=\s*"([^"]*)"', block)
+            file_match = re.search(r'texturefile\s*=\s*"([^"]*)"', block)
+            if not name_match or not file_match:
+                continue
+            raw_path = file_match.group(1).replace("\\", "/").strip()
+            candidate = content_root / raw_path
+            if candidate.is_file():
+                sprites.setdefault(name_match.group(1), candidate)
+    return sprites
+
+
+def _resolve_icon_ref(sprites: dict[str, Path], icon_ref: Optional[str]) -> Optional[Path]:
+    if not icon_ref:
+        return None
+    return sprites.get(f"GFX_{icon_ref}") or sprites.get(icon_ref)
 
 
 def _build_music_file_index(content_root: Path) -> dict[str, Path]:
@@ -382,10 +445,11 @@ def load_stations(descriptor_path: Path, content_root: Path, language: str = "en
     icon = _resolve_mod_icon(descriptor, descriptor_path, content_root)
     mod_id = str(content_root.resolve())
 
-    localisation = parse_localisation(content_root, language)
+    localisation, icon_refs = parse_localisation(content_root, language)
     definitions = parse_song_definitions(content_root)
     assignments = parse_station_assignments(content_root)
     file_index = _build_music_file_index(content_root)
+    sprites = parse_sprite_textures(content_root)
 
     def build_track(song_key: str, station_name: str) -> Optional[Track]:
         definition = definitions.get(song_key)
@@ -403,6 +467,7 @@ def load_stations(descriptor_path: Path, content_root: Path, language: str = "en
             mod_id=mod_id,
             station_name=station_name,
             mod_icon=icon,
+            track_icon=_resolve_icon_ref(sprites, icon_refs.get(song_key)),
             volume=definition["volume"],
         )
 

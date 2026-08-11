@@ -1,0 +1,12 @@
+spriteTypes = {
+	spriteType = {
+		name = "GFX_TFR_dam_dadi_doo"
+		texturefile = "gfx/TFR_album_covers/TFR_dam_dadi_doo.png"
+		legacy_lazy_load = no
+	}
+	spriteType = {
+		name = "GFX_TFR_i_love_all_of_you_who_downloaded_this_mod"
+		texturefile = "gfx/TFR_album_covers/TFR_generic.png"
+		legacy_lazy_load = no
+	}
+}

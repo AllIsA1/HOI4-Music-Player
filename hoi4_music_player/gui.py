@@ -229,7 +229,7 @@ class TrackListView(ttk.Frame):
         self._path_to_iid = {}
         for i, track in enumerate(tracks):
             iid = str(i)
-            icon = get_icon_photo(track.mod_icon, self.ICON_SIZE)
+            icon = get_icon_photo(track.icon, self.ICON_SIZE)
             playing = playing_path is not None and track.file_path == playing_path
             author = t(self.lang, "unknown_author") if track.mod_author == "Unknown" else track.mod_author
             self.tree.insert(
@@ -464,18 +464,22 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(top_bar, text="", text_color=theme.TEXT_SECONDARY)
         self.status_label.pack(side="left", padx=14)
 
-        self.search_entry = ctk.CTkEntry(
-            top_bar, placeholder_text=t(self.lang, "search_placeholder"),
-            textvariable=self.search_var, width=260, fg_color=theme.BG_ROW,
-            border_color=theme.BORDER, text_color=theme.TEXT_PRIMARY,
-        )
-        self.search_entry.pack(side="right", padx=16, pady=10)
-
+        # Packed before the search entry (both side="right") so it always
+        # claims its space at the far-right edge first and can never end up
+        # squeezed out if the window is narrow or the status text is long.
         self.language_btn = _styled_button(
-            top_bar, text=self._other_language().upper(), width=44,
+            top_bar, text=self._other_language().upper(), width=48,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, text_color=theme.ACCENT_TEXT,
             command=self._toggle_language,
         )
-        self.language_btn.pack(side="right", padx=(0, 4), pady=10)
+        self.language_btn.pack(side="right", padx=(0, 16), pady=10)
+
+        self.search_entry = ctk.CTkEntry(
+            top_bar, placeholder_text=t(self.lang, "search_placeholder"),
+            textvariable=self.search_var, width=220, fg_color=theme.BG_ROW,
+            border_color=theme.BORDER, text_color=theme.TEXT_PRIMARY,
+        )
+        self.search_entry.pack(side="right", padx=(16, 0), pady=10)
 
         # Sidebar (stations). Fixed width - a live drag-to-resize handle was
         # tried and reverted: CTkFrame's canvas redraw couldn't keep up
@@ -798,7 +802,7 @@ class App(ctk.CTk):
             self.now_title_label.configure(text=track.display_name)
             self.now_meta_label.configure(text=f"{track.mod_name}  •  {author}")
             self.now_icon_label.configure(
-                image=get_icon_image(track.mod_icon, NOWPLAYING_ICON_SIZE)
+                image=get_icon_image(track.icon, NOWPLAYING_ICON_SIZE)
             )
             if track.duration is None:
                 # Small delay so this never competes with the audio engine

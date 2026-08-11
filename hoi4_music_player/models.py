@@ -16,12 +16,21 @@ class Track:
     mod_id: str
     station_name: str = ""
     mod_icon: Optional[Path] = None
+    # Some mods embed a per-track album art reference (£sprite_name) in the
+    # song's title localisation, resolved via interface/*.gfx - see
+    # mod_scanner.parse_sprite_textures. Falls back to the mod's own icon
+    # (mod_icon) when a track doesn't have one of its own.
+    track_icon: Optional[Path] = None
     volume: float = 1.0
     duration: Optional[float] = None
 
     @property
     def display_name(self) -> str:
         return self.title or self.song_key
+
+    @property
+    def icon(self) -> Optional[Path]:
+        return self.track_icon or self.mod_icon
 
 
 @dataclass
