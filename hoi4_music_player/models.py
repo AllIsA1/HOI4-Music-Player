@@ -1,9 +1,14 @@
 """Data models for stations and tracks."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+# Hyphen-minus, en dash, em dash - all seen in the wild as the "Author - Title"
+# separator depending on what the mod author typed/pasted.
+_AUTHOR_TITLE_SEP_RE = re.compile(r"\s[-–—]\s")
 
 
 @dataclass
@@ -30,15 +35,18 @@ class Track:
 
     @property
     def _name_parts(self) -> tuple[Optional[str], str]:
-        """Splits a "<Author> - <Title>" display name into its parts. Many
-        mods embed the artist in the localised title this way instead of
+        """Splits a "<Author> - <Title>" display name into its parts (the
+        separator may be a hyphen-minus, en dash or em dash). Many mods
+        embed the artist in the localised title this way instead of
         providing it separately; falls back to (None, display_name) when
         the name isn't in that format."""
         name = self.display_name
-        author, sep, title = name.partition(" - ")
-        author, title = author.strip(), title.strip()
-        if sep and author and title:
-            return author, title
+        match = _AUTHOR_TITLE_SEP_RE.search(name)
+        if match:
+            author = name[:match.start()].strip()
+            title = name[match.end():].strip()
+            if author and title:
+                return author, title
         return None, name
 
     @property
