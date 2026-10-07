@@ -231,9 +231,9 @@ class TrackListView(ttk.Frame):
             iid = str(i)
             icon = get_icon_photo(track.icon, self.ICON_SIZE)
             playing = playing_path is not None and track.file_path == playing_path
-            author = t(self.lang, "unknown_author") if track.mod_author == "Unknown" else track.mod_author
+            author = track.track_author or t(self.lang, "unknown_author")
             self.tree.insert(
-                "", "end", iid=iid, text=f" {track.display_name}", image=icon,
+                "", "end", iid=iid, text=f" {track.track_title}", image=icon,
                 values=(track.station_name, track.mod_name, author, format_time(track.duration)),
                 tags=("playing",) if playing else (),
             )
@@ -750,7 +750,7 @@ class App(ctk.CTk):
                 or query in t.mod_author.lower()
                 or query in t.station_name.lower()
             ]
-        tracks.sort(key=lambda t: (t.station_name.lower(), t.display_name.lower()))
+        tracks.sort(key=lambda t: (t.station_name.lower(), t.track_title.lower()))
         self.current_display_tracks = tracks
 
         self.track_count_label.configure(text=t(self.lang, "tracks_header", count=len(tracks)))
@@ -798,8 +798,8 @@ class App(ctk.CTk):
             self.elapsed_label.configure(text="0:00")
             self.duration_label.configure(text="--:--")
         else:
-            author = t(self.lang, "unknown_author") if track.mod_author == "Unknown" else track.mod_author
-            self.now_title_label.configure(text=track.display_name)
+            author = track.track_author or t(self.lang, "unknown_author")
+            self.now_title_label.configure(text=track.track_title)
             self.now_meta_label.configure(text=f"{track.mod_name}  •  {author}")
             self.now_icon_label.configure(
                 image=get_icon_image(track.icon, NOWPLAYING_ICON_SIZE)

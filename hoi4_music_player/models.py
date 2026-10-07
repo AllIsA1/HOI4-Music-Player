@@ -29,6 +29,27 @@ class Track:
         return self.title or self.song_key
 
     @property
+    def _name_parts(self) -> tuple[Optional[str], str]:
+        """Splits a "<Author> - <Title>" display name into its parts. Many
+        mods embed the artist in the localised title this way instead of
+        providing it separately; falls back to (None, display_name) when
+        the name isn't in that format."""
+        name = self.display_name
+        author, sep, title = name.partition(" - ")
+        author, title = author.strip(), title.strip()
+        if sep and author and title:
+            return author, title
+        return None, name
+
+    @property
+    def track_title(self) -> str:
+        return self._name_parts[1]
+
+    @property
+    def track_author(self) -> Optional[str]:
+        return self._name_parts[0]
+
+    @property
     def icon(self) -> Optional[Path]:
         return self.track_icon or self.mod_icon
 
