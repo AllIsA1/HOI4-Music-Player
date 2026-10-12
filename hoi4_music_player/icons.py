@@ -1,190 +1,215 @@
-"""Procedurally drawn, anti-aliased vector-style icons for player controls.
-Drawn at 4x scale and downsampled so edges stay smooth at any target size,
-instead of relying on font/emoji glyphs that render inconsistently across
-operating systems."""
+"""Line icons and round controls, drawn with PIL on a 24-unit grid at 4x and
+downsampled. Anything round is pre-rendered here because Tk's own canvas
+ovals aren't anti-aliased on X11."""
 from __future__ import annotations
 
 import math
 from typing import Callable
 
-import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 
-_SUPERSAMPLE = 4
-_cache: dict[tuple, ctk.CTkImage] = {}
+_SS = 4
+_photo_cache: dict[tuple, ImageTk.PhotoImage] = {}
+
+Point = tuple[float, float]
 
 
-def _render(name: str, size: int, color: str, draw_fn: Callable[[ImageDraw.ImageDraw, float, str], None]) -> ctk.CTkImage:
-    key = (name, size, color)
-    cached = _cache.get(key)
-    if cached is not None:
-        return cached
-    s = size * _SUPERSAMPLE
+class _Pen:
+    def __init__(self, draw: ImageDraw.ImageDraw, unit: float, color: str, stroke: float = 1.7):
+        self.d = draw
+        self.u = unit
+        self.color = color
+        self.w = max(_SS, stroke * unit)
+
+    def p(self, x: float, y: float) -> Point:
+        return (x * self.u, y * self.u)
+
+    def line(self, *points: Point, width: float | None = None) -> None:
+        w = self.w if width is None else width * self.u
+        pts = [self.p(x, y) for x, y in points]
+        self.d.line(pts, fill=self.color, width=int(w), joint="curve")
+        r = w / 2
+        for x, y in (pts[0], pts[-1]):
+            self.d.ellipse([x - r, y - r, x + r, y + r], fill=self.color)
+
+    def poly(self, *points: Point) -> None:
+        self.d.polygon([self.p(x, y) for x, y in points], fill=self.color)
+
+    def rrect(self, x0, y0, x1, y1, r) -> None:
+        self.d.rounded_rectangle([*self.p(x0, y0), *self.p(x1, y1)], radius=r * self.u, fill=self.color)
+
+    def arc(self, cx, cy, r, start, end) -> None:
+        box = [*self.p(cx - r, cy - r), *self.p(cx + r, cy + r)]
+        self.d.arc(box, start=start, end=end, fill=self.color, width=int(self.w))
+
+    def circle(self, cx, cy, r, outline: bool = False) -> None:
+        box = [*self.p(cx - r, cy - r), *self.p(cx + r, cy + r)]
+        if outline:
+            self.d.ellipse(box, outline=self.color, width=int(self.w))
+        else:
+            self.d.ellipse(box, fill=self.color)
+
+
+def _play(pen: _Pen) -> None:
+    pen.poly((7.5, 4.8), (7.5, 19.2), (19, 12))
+
+
+def _pause(pen: _Pen) -> None:
+    pen.rrect(6.5, 5, 10, 19, 0.8)
+    pen.rrect(14, 5, 17.5, 19, 0.8)
+
+
+def _next(pen: _Pen) -> None:
+    pen.poly((5, 5.5), (5, 18.5), (15.5, 12))
+    pen.rrect(16.2, 5.5, 18.8, 18.5, 0.6)
+
+
+def _prev(pen: _Pen) -> None:
+    pen.poly((19, 5.5), (19, 18.5), (8.5, 12))
+    pen.rrect(5.2, 5.5, 7.8, 18.5, 0.6)
+
+
+def _shuffle(pen: _Pen) -> None:
+    pen.line((3.5, 17), (7.5, 17), (15.5, 7), (19.5, 7))
+    pen.line((3.5, 7), (7.5, 7), (10, 10.1))
+    pen.line((13.2, 13.9), (15.5, 17), (19.5, 17))
+    pen.line((17, 4.5), (19.8, 7), (17, 9.5))
+    pen.line((17, 14.5), (19.8, 17), (17, 19.5))
+
+
+def _repeat(pen: _Pen) -> None:
+    pen.line((5, 11.5), (5, 8.5), (6.5, 7), (18.5, 7))
+    pen.line((16, 4.5), (18.8, 7), (16, 9.5))
+    pen.line((19, 12.5), (19, 15.5), (17.5, 17), (5.5, 17))
+    pen.line((8, 14.5), (5.2, 17), (8, 19.5))
+
+
+def _repeat_one(pen: _Pen) -> None:
+    _repeat(pen)
+    pen.line((11, 10.6), (12.4, 9.6), (12.4, 14.2), width=1.5)
+
+
+def _speaker(pen: _Pen) -> None:
+    pen.poly((3.5, 9), (7.5, 9), (12, 5), (12, 19), (7.5, 15), (3.5, 15))
+
+
+def _volume_high(pen: _Pen) -> None:
+    _speaker(pen)
+    pen.arc(12, 12, 4, -50, 50)
+    pen.arc(12, 12, 8, -50, 50)
+
+
+def _volume_low(pen: _Pen) -> None:
+    _speaker(pen)
+    pen.arc(12, 12, 4, -50, 50)
+
+
+def _volume_mute(pen: _Pen) -> None:
+    _speaker(pen)
+    pen.line((15.5, 9.5), (20.5, 14.5))
+    pen.line((20.5, 9.5), (15.5, 14.5))
+
+
+def _folder(pen: _Pen) -> None:
+    pen.line((3.5, 18.5), (3.5, 5.5), (9.5, 5.5), (11.5, 8), (20.5, 8), (20.5, 18.5), (3.5, 18.5))
+
+
+def _refresh(pen: _Pen) -> None:
+    cx, cy, r, end_deg = 12, 12, 7, 320
+    pen.arc(cx, cy, r, 35, end_deg)
+    a = math.radians(end_deg)
+    ex, ey = cx + r * math.cos(a), cy + r * math.sin(a)
+    # PIL arcs run clockwise, so travel at the end point is (-sin a, cos a);
+    # the arrowhead's arms point back against that direction.
+    back = math.atan2(-math.cos(a), math.sin(a))
+    arm = 3.6
+    pen.line(
+        (ex + arm * math.cos(back + 0.75), ey + arm * math.sin(back + 0.75)),
+        (ex, ey),
+        (ex + arm * math.cos(back - 0.75), ey + arm * math.sin(back - 0.75)),
+    )
+
+
+def _search(pen: _Pen) -> None:
+    pen.circle(10.5, 10.5, 6.2, outline=True)
+    pen.line((15.2, 15.2), (19.8, 19.8))
+
+
+def _close(pen: _Pen) -> None:
+    pen.line((7, 7), (17, 17))
+    pen.line((17, 7), (7, 17))
+
+
+def _plus(pen: _Pen) -> None:
+    pen.line((12, 5.5), (12, 18.5))
+    pen.line((5.5, 12), (18.5, 12))
+
+
+def _eq(pen: _Pen) -> None:
+    pen.rrect(4.5, 9, 8, 19, 0.6)
+    pen.rrect(10.25, 4.5, 13.75, 19, 0.6)
+    pen.rrect(16, 12, 19.5, 19, 0.6)
+
+
+_GLYPHS: dict[str, Callable[[_Pen], None]] = {
+    "play": _play, "pause": _pause, "next": _next, "prev": _prev,
+    "shuffle": _shuffle, "repeat": _repeat, "repeat_one": _repeat_one,
+    "volume_high": _volume_high, "volume_low": _volume_low, "volume_mute": _volume_mute,
+    "folder": _folder, "refresh": _refresh, "search": _search, "close": _close,
+    "plus": _plus, "eq": _eq,
+}
+
+
+def glyph_image(name: str, size: int, color: str) -> Image.Image:
+    s = size * _SS
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw_fn(draw, s, color)
-    img = img.resize((size, size), Image.LANCZOS)
-    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
-    _cache[key] = ctk_img
-    return ctk_img
+    _GLYPHS[name](_Pen(ImageDraw.Draw(img), s / 24, color))
+    return img.resize((size, size), Image.LANCZOS)
 
 
-def _play(draw, s, color):
-    m = s * 0.24
-    draw.polygon([(m, s * 0.14), (m, s * 0.86), (s * 0.86, s * 0.5)], fill=color)
+def icon(name: str, size: int, color: str) -> ImageTk.PhotoImage:
+    key = ("icon", name, size, color)
+    photo = _photo_cache.get(key)
+    if photo is None:
+        photo = ImageTk.PhotoImage(glyph_image(name, size, color))
+        _photo_cache[key] = photo
+    return photo
 
 
-def _pause(draw, s, color):
-    bar_w = s * 0.20
-    gap = s * 0.14
-    x0 = s * 0.5 - gap / 2 - bar_w
-    x1 = s * 0.5 + gap / 2
-    r = bar_w * 0.35
-    draw.rounded_rectangle([x0, s * 0.15, x0 + bar_w, s * 0.85], radius=r, fill=color)
-    draw.rounded_rectangle([x1, s * 0.15, x1 + bar_w, s * 0.85], radius=r, fill=color)
+def knob(size: int, fill: str, glyph: str, glyph_color: str) -> ImageTk.PhotoImage:
+    """A filled circle with a glyph in it - the main play/pause control."""
+    key = ("knob", size, fill, glyph, glyph_color)
+    photo = _photo_cache.get(key)
+    if photo is None:
+        s = size * _SS
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        ImageDraw.Draw(img).ellipse([0, 0, s - 1, s - 1], fill=fill)
+        img = img.resize((size, size), Image.LANCZOS)
+        g = glyph_image(glyph, int(size * 0.5), glyph_color)
+        offset_x = int(size * 0.03) if glyph == "play" else 0
+        img.alpha_composite(g, ((size - g.width) // 2 + offset_x, (size - g.height) // 2))
+        photo = ImageTk.PhotoImage(img)
+        _photo_cache[key] = photo
+    return photo
 
 
-def _skip(draw, s, color, flip: bool):
-    def pts(x):
-        tri = [(x, s * 0.18), (x, s * 0.82), (x + s * 0.30, s * 0.5)]
-        return tri
-
-    triangle = pts(s * 0.16)
-    bar = [s * 0.68, s * 0.16, s * 0.78, s * 0.84]
-    if flip:
-        triangle = [(s - x, y) for x, y in triangle]
-        bar = [s - bar[2], bar[1], s - bar[0], bar[3]]
-    draw.polygon(triangle, fill=color)
-    draw.rounded_rectangle(bar, radius=s * 0.02, fill=color)
-
-
-def _next(draw, s, color):
-    _skip(draw, s, color, flip=False)
-
-
-def _previous(draw, s, color):
-    _skip(draw, s, color, flip=True)
-
-
-def _shuffle(draw, s, color):
-    lw = max(2, int(s * 0.08))
-
-    path_down = [(s * 0.12, s * 0.28), (s * 0.42, s * 0.28), (s * 0.88, s * 0.76)]
-    path_up = [(s * 0.12, s * 0.76), (s * 0.42, s * 0.76), (s * 0.88, s * 0.28)]
-    draw.line(path_down, fill=color, width=lw, joint="curve")
-    draw.line(path_up, fill=color, width=lw, joint="curve")
-
-    def arrowhead(tip, tail):
-        ang = math.atan2(tip[1] - tail[1], tip[0] - tail[0])
-        head = s * 0.16
-        for da in (0.5, -0.5):
-            hx = tip[0] - head * math.cos(ang - da)
-            hy = tip[1] - head * math.sin(ang - da)
-            draw.line([tip, (hx, hy)], fill=color, width=lw)
-
-    arrowhead(path_down[-1], path_down[-2])
-    arrowhead(path_up[-1], path_up[-2])
-
-
-def _repeat_arc(draw, s, color, badge: str = ""):
-    cx, cy, r = s * 0.5, s * 0.48, s * 0.30
-    width = max(2, int(s * 0.10))
-    draw.arc([cx - r, cy - r, cx + r, cy + r], start=20, end=290, fill=color, width=width)
-    ang = math.radians(290)
-    ax, ay = cx + r * math.cos(ang), cy + r * math.sin(ang)
-    head = s * 0.15
-    tangent = ang - math.pi / 2
-    for da in (0.55, -0.55):
-        hx = ax - head * math.cos(tangent - da)
-        hy = ay - head * math.sin(tangent - da)
-        draw.line([(ax, ay), (hx, hy)], fill=color, width=width)
-    if badge:
-        try:
-            from PIL import ImageFont
-            font = ImageFont.truetype("arial.ttf", int(s * 0.36))
-        except Exception:
-            font = None
-        bbox = draw.textbbox((0, 0), badge, font=font) if font else (0, 0, s * 0.2, s * 0.3)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text((cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1] - s * 0.02), badge, fill=color, font=font)
-
-
-def _volume(draw, s, color):
-    body = [(s * 0.14, s * 0.38), (s * 0.32, s * 0.38), (s * 0.52, s * 0.20), (s * 0.52, s * 0.80), (s * 0.32, s * 0.62), (s * 0.14, s * 0.62)]
-    draw.polygon(body, fill=color)
-    lw = max(2, int(s * 0.06))
-    draw.arc([s * 0.56, s * 0.32, s * 0.74, s * 0.68], start=-55, end=55, fill=color, width=lw)
-    draw.arc([s * 0.62, s * 0.20, s * 0.88, s * 0.80], start=-50, end=50, fill=color, width=lw)
-
-
-def _folder(draw, s, color):
-    pts = [
-        (s * 0.12, s * 0.26),
-        (s * 0.40, s * 0.26),
-        (s * 0.48, s * 0.36),
-        (s * 0.88, s * 0.36),
-        (s * 0.88, s * 0.80),
-        (s * 0.12, s * 0.80),
-    ]
-    draw.polygon(pts, fill=color)
-
-
-def _refresh(draw, s, color):
-    cx, cy, r = s * 0.5, s * 0.5, s * 0.32
-    width = max(2, int(s * 0.10))
-    draw.arc([cx - r, cy - r, cx + r, cy + r], start=-200, end=160, fill=color, width=width)
-    ang = math.radians(160)
-    ax, ay = cx + r * math.cos(ang), cy + r * math.sin(ang)
-    head = s * 0.16
-    tangent = ang - math.pi / 2
-    for da in (0.55, -0.55):
-        hx = ax - head * math.cos(tangent - da)
-        hy = ay - head * math.sin(tangent - da)
-        draw.line([(ax, ay), (hx, hy)], fill=color, width=width)
-
-
-def _search(draw, s, color):
-    lw = max(2, int(s * 0.09))
-    draw.ellipse([s * 0.14, s * 0.14, s * 0.62, s * 0.62], outline=color, width=lw)
-    draw.line([(s * 0.56, s * 0.56), (s * 0.86, s * 0.86)], fill=color, width=lw)
-
-
-def play_icon(size=22, color="#ffffff"):
-    return _render("play", size, color, _play)
-
-
-def pause_icon(size=22, color="#ffffff"):
-    return _render("pause", size, color, _pause)
-
-
-def next_icon(size=22, color="#ffffff"):
-    return _render("next", size, color, _next)
-
-
-def previous_icon(size=22, color="#ffffff"):
-    return _render("previous", size, color, _previous)
-
-
-def shuffle_icon(size=22, color="#ffffff"):
-    return _render("shuffle", size, color, _shuffle)
-
-
-def repeat_icon(size=22, color="#ffffff", mode: str = "all"):
-    badge = "1" if mode == "one" else ""
-    return _render(f"repeat_{mode}", size, color, lambda d, s, c: _repeat_arc(d, s, c, badge))
-
-
-def volume_icon(size=20, color="#ffffff"):
-    return _render("volume", size, color, _volume)
-
-
-def folder_icon(size=18, color="#ffffff"):
-    return _render("folder", size, color, _folder)
-
-
-def refresh_icon(size=18, color="#ffffff"):
-    return _render("refresh", size, color, _refresh)
-
-
-def search_icon(size=16, color="#ffffff"):
-    return _render("search", size, color, _search)
+def dot(size: int, color: str, ring: bool = False, halo: str | None = None) -> ImageTk.PhotoImage:
+    """Station on/off lamp: a solid dot (optionally with a soft halo) or a
+    hollow ring."""
+    key = ("dot", size, color, ring, halo)
+    photo = _photo_cache.get(key)
+    if photo is None:
+        s = size * _SS
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        if halo:
+            d.ellipse([0, 0, s - 1, s - 1], fill=halo)
+        inset = s * 0.25
+        box = [inset, inset, s - 1 - inset, s - 1 - inset]
+        if ring:
+            d.ellipse(box, outline=color, width=max(_SS, int(s * 0.07)))
+        else:
+            d.ellipse(box, fill=color)
+        photo = ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
+        _photo_cache[key] = photo
+    return photo

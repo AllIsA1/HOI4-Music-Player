@@ -31,7 +31,7 @@ system at all (older/simpler mods that just put `song =`/`file =` together in on
 block) still work — their tracks land under a single fallback "station" named
 after the mod.
 
-Point "Manage Folders…" at a folder that either:
+Add a folder (the **Folders** button, or **Add folder…** on first launch) that either:
 - **is** a single mod (contains a `descriptor.mod`/`<name>.mod` directly), or
 - **contains** several mods — e.g. a Steam Workshop `content/<appid>/` folder, or
   your `Documents/Paradox Interactive/Hearts of Iron IV/mod/` folder — every mod
@@ -40,26 +40,29 @@ Point "Manage Folders…" at a folder that either:
   own folder) and local/manual installs (a standalone `<name>.mod` sitting next to
   its content folder).
 
-A mod with no music tracks is skipped. The author field isn't part of the
-standard HOI4 mod format, so it's used when a mod happens to provide one
-(non-standard `author=` field in `descriptor.mod`, or an `author.txt`/`credits.txt`
-file); otherwise it shows as "Unknown".
+A mod with no music tracks is skipped. HOI4 has no separate artist field, but most
+mods name their tracks "Artist - Title" — the player splits that (a hyphen, en dash
+or em dash all work) into the Artist and Title columns; a name without that
+separator shows its artist as "Unknown".
 
 ## Features
 
-- Browse tracks by radio station, or across "All Stations" at once
-- Enable/disable individual stations — disabled stations' tracks never show up or play
-- Search by track title, station name, mod name, or author
-- Play / pause / previous / next, volume control, click/drag the progress bar to seek
+- Browse tracks by radio station, or across "All stations" at once; double-click a station to play it
+- Switch individual stations on/off with the lamp next to them — a switched-off station's tracks never show up or play
+- Search by track title, artist, station or mod
+- Play / pause / previous / next, shuffle, repeat (all / one), volume and mute
+- Seek on the tuning dial — click or drag anywhere on it
 - Shows each track's real duration (read in the background after scanning)
-- Mod icon shown per track and in the now-playing bar
+- Per-track album art in the list (when a mod has it), mod art in the player bar
+- Keyboard: <kbd>Space</kbd> play/pause, <kbd>Ctrl</kbd>+<kbd>F</kbd> search, <kbd>Esc</kbd> clear search, <kbd>Enter</kbd> play the selected track
 - English/Russian UI, and prefers a mod's Russian localisation for track/station names when available (falls back to English per-key if a translation is missing)
 
 ## Download
 
-Grab the latest Windows build from the [Releases page](../../releases) — a single
-`HOI4MusicPlayer.exe`, no installation needed. On Linux, build the binary yourself
-(one command, see below) or run it directly from source.
+Grab the latest build from the [Releases page](../../releases) — no installation needed:
+
+- **Windows:** `HOI4MusicPlayer.exe`
+- **Linux:** `HOI4MusicPlayer-x86_64.AppImage` — `chmod +x` it and run
 
 ## Running from source
 
@@ -107,7 +110,7 @@ build a one-file, windowed binary with the app icon embedded.
 
 ## Configuration
 
-Settings (added folders, volume, which stations are disabled) are stored at:
+Settings (added folders, volume, language, shuffle/repeat, which stations are switched off) are stored at:
 
 - Windows: `%USERPROFILE%\.hoi4_music_player\config.json`
 - Linux: `~/.hoi4_music_player/config.json`
@@ -116,7 +119,7 @@ Delete that file to reset the player to a clean state.
 
 ## Tech stack
 
-- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) for the UI
+- Tk/ttk (Python's standard `tkinter`) for the UI, with bundled [IBM Plex](https://github.com/IBM/plex) fonts (SIL OFL 1.1, see `hoi4_music_player/fonts/`)
 - [pygame](https://www.pygame.org/) (`pygame.mixer`) for cross-platform `.ogg`/`.mp3`/`.wav` playback
 - [mutagen](https://mutagen.readthedocs.io/) to read track durations
 - [Pillow](https://python-pillow.org/) for icons

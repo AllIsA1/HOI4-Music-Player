@@ -17,7 +17,8 @@ pip install --quiet pyinstaller
 pyinstaller --noconfirm --clean --onefile --windowed ^
     --name HOI4MusicPlayer ^
     --icon assets\icon.ico ^
-    --collect-data customtkinter ^
+    --add-data "hoi4_music_player/fonts:hoi4_music_player/fonts" ^
+    --hidden-import PIL._tkinter_finder ^
     run.py
 
 echo.

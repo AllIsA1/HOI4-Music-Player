@@ -14,6 +14,8 @@ DEFAULTS = {
     "disabled_station_keys": [],
     "volume": 0.7,
     "language": DEFAULT_LANGUAGE,
+    "shuffle": False,
+    "repeat": "off",
 }
 
 
@@ -89,4 +91,23 @@ class Config:
     @language.setter
     def language(self, value: str) -> None:
         self.data["language"] = value if value in LANGUAGES else DEFAULT_LANGUAGE
+        self.save()
+
+    @property
+    def shuffle(self) -> bool:
+        return bool(self.data["shuffle"])
+
+    @shuffle.setter
+    def shuffle(self, value: bool) -> None:
+        self.data["shuffle"] = bool(value)
+        self.save()
+
+    @property
+    def repeat(self) -> str:
+        value = self.data["repeat"]
+        return value if value in ("off", "all", "one") else "off"
+
+    @repeat.setter
+    def repeat(self, value: str) -> None:
+        self.data["repeat"] = value
         self.save()

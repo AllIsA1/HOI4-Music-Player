@@ -1,635 +1,437 @@
-"""CustomTkinter-based UI for the HOI4 Music Player."""
+"""Main window of the HOI4 Music Player (plain Tk/ttk, see widgets.py)."""
 from __future__ import annotations
 
+import ctypes
 import sys
 import threading
+import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import filedialog, ttk
 from typing import Optional
 
-import customtkinter as ctk
-from tkinter import filedialog
 from PIL import ImageTk
 
-from . import i18n, theme
+from . import fonts, i18n, icons, theme
+from .brand import app_icon
 from .config import Config
 from .duration import compute_track_duration
 from .i18n import t
-from .icons import (
-    folder_icon,
-    next_icon,
-    pause_icon,
-    play_icon,
-    previous_icon,
-    refresh_icon,
-    volume_icon,
-)
 from .mod_scanner import scan_folders_detailed
 from .models import Station, Track
-from .player_engine import PlayerEngine
-from .utils import (
-    format_time,
-    get_app_icon_image,
-    get_app_icon_ico_path,
-    get_icon_image,
-    get_icon_photo,
+from .player_engine import PlayerEngine, RepeatMode
+from .theme import px
+from .utils import cover_photo, format_time, temp_ico_path
+from .widgets import (
+    Dial,
+    FlatButton,
+    KnobButton,
+    LangSwitch,
+    SearchBox,
+    Slider,
+    StationList,
+    StationRowData,
+    TrackTable,
+    setup_styles,
 )
 
-ctk.set_appearance_mode("dark")
-
-SIDEBAR_ICON_SIZE = 40
-NOWPLAYING_ICON_SIZE = 56
-SIDEBAR_WIDTH = 320
-
-_ROW_COLORS = {
-    "normal": theme.BG_ROW,
-    "hover": theme.BG_ROW_HOVER,
-    "selected": theme.BG_ROW_SELECTED,
-    "playing": theme.BG_ROW_PLAYING,
-}
+SIDEBAR_WIDTH = 288
+TOOLBAR_HEIGHT = 64
+COVER_SIZE = 48
 
 
-# Static wrap width for sidebar station rows, rather than clipping long
-# names. A dynamic (per-resize) wraplength and a resizable sidebar were
-# both tried and reverted - see gui.py history/README - reconfiguring
-# widget geometry on every pixel of drag/resize motion made customtkinter's
-# canvas redraw fall behind and leave visible artifacts on screen.
-SIDEBAR_LABEL_WRAP = 230
+def _enable_dpi_awareness() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
-class _HoverRow(ctk.CTkFrame):
-    """A CTkFrame that lightens on hover and supports a persistent
-    selected/playing highlight state."""
-
-    def __init__(self, master, **kwargs):
-        # corner_radius=0 / border_width=0: rounded corners and borders are
-        # redrawn on canvas on every resize, which gets expensive with
-        # hundreds of rows in a mod's track list. Flat rows + spacing
-        # between them (see .pack(pady=...) at the call sites) look almost
-        # identical and are far cheaper to keep redrawing while resizing.
-        kwargs.setdefault("corner_radius", 0)
-        kwargs.setdefault("fg_color", theme.BG_ROW)
-        kwargs.setdefault("border_width", 0)
-        super().__init__(master, **kwargs)
-        self._state = "normal"
-
-    def _bind_hover(self, widget):
-        widget.bind("<Enter>", self._on_enter)
-        widget.bind("<Leave>", self._on_leave)
-
-    def _on_enter(self, _event=None):
-        if self._state == "normal":
-            self.configure(fg_color=_ROW_COLORS["hover"])
-
-    def _on_leave(self, _event=None):
-        self.configure(fg_color=_ROW_COLORS[self._state])
-
-    def set_state(self, state: str):
-        self._state = state
-        self.configure(fg_color=_ROW_COLORS[state])
+def _dark_title_bar(window: tk.Misc) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1)
+        # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE; 19 on Windows 10 builds before 20H1.
+        for attribute in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+            ) == 0:
+                break
+    except Exception:
+        pass
 
 
-class StationRow(_HoverRow):
-    def __init__(self, master, station: Station, enabled: bool, on_toggle, on_select, lang: str = "en"):
-        super().__init__(master)
-        self.station = station
-        self.on_select = on_select
-
-        self.grid_columnconfigure(2, weight=1)
-
-        self.checkbox_var = ctk.BooleanVar(value=enabled)
-        checkbox = ctk.CTkCheckBox(
-            self, text="", variable=self.checkbox_var, width=20,
-            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
-            checkmark_color=theme.ACCENT_TEXT, border_color=theme.TEXT_MUTED,
-            command=lambda: on_toggle(station.key, self.checkbox_var.get()),
-        )
-        checkbox.grid(row=0, column=0, rowspan=2, padx=(8, 4), pady=8)
-
-        icon_label = ctk.CTkLabel(self, text="", image=get_icon_image(station.mod_icon, SIDEBAR_ICON_SIZE))
-        icon_label.grid(row=0, column=1, rowspan=2, padx=(2, 10), pady=8)
-
-        name_label = ctk.CTkLabel(
-            self, text=station.name, anchor="w", text_color=theme.TEXT_PRIMARY,
-            font=ctk.CTkFont(weight="bold"), wraplength=SIDEBAR_LABEL_WRAP, justify="left",
-        )
-        name_label.grid(row=0, column=2, sticky="ew", padx=(0, 10), pady=(8, 0))
-
-        subtitle = t(lang, "station_subtitle", mod=station.mod_name, count=station.track_count)
-        sub_label = ctk.CTkLabel(
-            self, text=subtitle, anchor="w", font=ctk.CTkFont(size=11),
-            text_color=theme.TEXT_SECONDARY, wraplength=SIDEBAR_LABEL_WRAP, justify="left",
-        )
-        sub_label.grid(row=1, column=2, sticky="ew", padx=(0, 10), pady=(0, 8))
-
-        for widget in (self, icon_label, name_label, sub_label):
-            widget.bind("<Button-1>", lambda e: self.on_select(station.key))
-            self._bind_hover(widget)
-
-    def set_selected(self, selected: bool):
-        self.set_state("selected" if selected else "normal")
-
-
-class TrackListView(ttk.Frame):
-    """The track list, backed by a native ttk.Treeview instead of one
-    CTkFrame-based row per track.
-
-    A CTkFrame/CTkLabel/CTkButton row per track was the original design,
-    but creating a few thousand of them synchronously (a real HOI4 library
-    can run 2000-3000+ tracks) reliably froze the whole app - Windows
-    reported it as "Not Responding" and it never recovered, which is
-    exactly what looks like a crash to a user. ttk.Treeview is a real
-    virtualized widget (implemented natively in Tk, not built out of our
-    own child widgets): it only ever draws the rows currently in the
-    visible viewport no matter how many items it holds, so it stays fast
-    and responsive at any list size without needing any manual lazy
-    creation, pagination, or eviction scheme."""
-
-    ROW_HEIGHT = 34
-    ICON_SIZE = 22
-
-    def __init__(self, master, on_play, lang: str = "en"):
-        super().__init__(master)
-        self.on_play = on_play
-        self.lang = lang
-        self.tracks: list[Track] = []
-        self._path_to_iid: dict[Path, str] = {}
-
-        self._configure_style()
-
-        columns = ("station", "mod", "author", "duration")
-        self.tree = ttk.Treeview(
-            self, columns=columns, show="tree headings",
-            style="Tracks.Treeview", selectmode="browse",
-        )
-        self._apply_headings()
-        self.tree.column("#0", width=320, minwidth=160, anchor="w", stretch=True)
-        self.tree.column("station", width=150, minwidth=80, anchor="w", stretch=False)
-        self.tree.column("mod", width=170, minwidth=80, anchor="w", stretch=False)
-        self.tree.column("author", width=130, minwidth=60, anchor="w", stretch=False)
-        self.tree.column("duration", width=60, minwidth=50, anchor="e", stretch=False)
-        self.tree.tag_configure("playing", background=theme.BG_ROW_PLAYING)
-
-        vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Tracks.Vertical.TScrollbar")
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-        self.tree.bind("<Double-Button-1>", self._on_double_click)
-        self.tree.bind("<Return>", self._on_enter_key)
-
-    def _apply_headings(self):
-        self.tree.heading("#0", text=t(self.lang, "col_track"), anchor="w")
-        self.tree.heading("station", text=t(self.lang, "col_station"), anchor="w")
-        self.tree.heading("mod", text=t(self.lang, "col_mod"), anchor="w")
-        self.tree.heading("author", text=t(self.lang, "col_author"), anchor="w")
-        self.tree.heading("duration", text=t(self.lang, "col_time"), anchor="e")
-
-    def set_language(self, lang: str):
-        self.lang = lang
-        self._apply_headings()
-
-    def _configure_style(self):
-        # theme_use("clam") is also set globally in App.__init__ - repeated
-        # here too since it must be active before these style.configure()
-        # calls for them to stick (Windows' default "vista" ttk theme draws
-        # Treeview/Scrollbar natively via the OS and ignores color options
-        # like background/troughcolor entirely; "clam" is a full Tk-drawn
-        # theme that honors them).
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure(
-            "Tracks.Treeview",
-            background=theme.BG_ROW, fieldbackground=theme.BG_ROW,
-            foreground=theme.TEXT_PRIMARY, borderwidth=0,
-            rowheight=self.ROW_HEIGHT, font=("Segoe UI", 10),
-        )
-        style.map(
-            "Tracks.Treeview",
-            background=[("selected", theme.BG_ROW_SELECTED)],
-            foreground=[("selected", theme.TEXT_PRIMARY)],
-        )
-        style.configure(
-            "Tracks.Treeview.Heading",
-            background=theme.BG_TOPBAR, foreground=theme.TEXT_SECONDARY,
-            borderwidth=0, relief="flat", font=("Segoe UI", 9, "bold"),
-        )
-        style.map("Tracks.Treeview.Heading", background=[("active", theme.BG_TOPBAR)])
-        style.configure(
-            "Tracks.Vertical.TScrollbar",
-            background=theme.BUTTON_NEUTRAL, troughcolor=theme.BG_PANEL,
-            bordercolor=theme.BG_PANEL, arrowcolor=theme.TEXT_SECONDARY,
-        )
-
-    def set_tracks(self, tracks: list[Track], playing_path: Optional[Path]):
-        self.tree.delete(*self.tree.get_children())
-        self.tracks = tracks
-        self._path_to_iid = {}
-        for i, track in enumerate(tracks):
-            iid = str(i)
-            icon = get_icon_photo(track.icon, self.ICON_SIZE)
-            playing = playing_path is not None and track.file_path == playing_path
-            author = track.track_author or t(self.lang, "unknown_author")
-            self.tree.insert(
-                "", "end", iid=iid, text=f" {track.track_title}", image=icon,
-                values=(track.station_name, track.mod_name, author, format_time(track.duration)),
-                tags=("playing",) if playing else (),
-            )
-            self._path_to_iid[track.file_path] = iid
-        if playing_path is not None and playing_path in self._path_to_iid:
-            self.tree.see(self._path_to_iid[playing_path])
-
-    def set_playing(self, playing_path: Optional[Path]):
-        for iid in self.tree.tag_has("playing"):
-            self.tree.item(iid, tags=())
-        if playing_path is None:
-            return
-        iid = self._path_to_iid.get(playing_path)
-        if iid is not None:
-            self.tree.item(iid, tags=("playing",))
-            self.tree.see(iid)
-
-    def update_track_duration(self, track: Track):
-        iid = self._path_to_iid.get(track.file_path)
-        if iid is not None:
-            self.tree.set(iid, "duration", format_time(track.duration))
-
-    def _on_double_click(self, event):
-        iid = self.tree.identify_row(event.y)
-        if iid:
-            self._play_iid(iid)
-
-    def _on_enter_key(self, _event):
-        selection = self.tree.selection()
-        if selection:
-            self._play_iid(selection[0])
-
-    def _play_iid(self, iid: str):
-        index = int(iid)
-        if 0 <= index < len(self.tracks):
-            self.on_play(self.tracks[index])
-
-
-def _styled_button(master, **kwargs):
-    defaults = dict(
-        fg_color=theme.BUTTON_NEUTRAL, hover_color=theme.BUTTON_NEUTRAL_HOVER,
-        text_color=theme.TEXT_PRIMARY, corner_radius=8,
+def _style_stock_widgets(root: tk.Tk) -> None:
+    """Dark colours for stock widgets we don't build ourselves - mostly Tk's
+    own file dialog on Linux."""
+    root.tk_setPalette(
+        background=theme.BG, foreground=theme.TEXT, activeBackground=theme.RAISED,
+        activeForeground=theme.TEXT, highlightColor=theme.LINE_STRONG, highlightBackground=theme.BG,
+        selectBackground=theme.SELECTED, selectForeground=theme.TEXT, insertBackground=theme.TEXT,
+        troughColor=theme.PANEL, disabledForeground=theme.TEXT_3,
     )
-    defaults.update(kwargs)
-    return ctk.CTkButton(master, **defaults)
+    style = ttk.Style(root)
+    style.configure(".", background=theme.BG, foreground=theme.TEXT, fieldbackground=theme.PANEL,
+                    bordercolor=theme.LINE, lightcolor=theme.RAISED, darkcolor=theme.RAISED,
+                    troughcolor=theme.PANEL, selectbackground=theme.SELECTED, selectforeground=theme.TEXT,
+                    insertcolor=theme.TEXT, arrowcolor=theme.TEXT_2, focuscolor=theme.LINE_STRONG,
+                    font=theme.FONTS["small"])
+    style.configure("TButton", background=theme.RAISED, padding=(px(10), px(4)))
+    style.map("TButton", background=[("active", theme.SELECTED)])
+    style.map("TCombobox", fieldbackground=[("readonly", theme.PANEL)],
+              background=[("active", theme.RAISED)], foreground=[("readonly", theme.TEXT)])
 
 
-class FolderManagerDialog(ctk.CTkToplevel):
-    def __init__(self, master, config_store: Config, on_change, lang: str = "en"):
-        super().__init__(master)
-        self.lang = lang
-        self.title(t(lang, "manage_folders_title"))
-        self.geometry("580x380")
-        self.configure(fg_color=theme.BG_APP)
-        self.config_store = config_store
-        self.on_change = on_change
-        self.transient(master)
+class EmptyState(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=theme.PANEL)
+        inner = tk.Frame(self, bg=theme.PANEL)
+        inner.place(relx=0.5, rely=0.4, anchor="center")
+        tk.Label(inner, image=cover_photo(None, px(72), radius=px(8)), bg=theme.PANEL).pack(pady=(0, px(18)))
+        self.title = tk.Label(inner, font=theme.FONTS["empty_title"], fg=theme.TEXT, bg=theme.PANEL)
+        self.title.pack()
+        self.body = tk.Label(inner, font=theme.FONTS["body"], fg=theme.TEXT_2, bg=theme.PANEL,
+                             wraplength=px(440), justify="center")
+        self.body.pack(pady=(px(6), 0))
+        self.actions = tk.Frame(inner, bg=theme.PANEL)
+        self.actions.pack(pady=(px(20), 0))
 
-        ctk.CTkLabel(
-            self, text=t(lang, "manage_folders_body"),
-            justify="left", text_color=theme.TEXT_PRIMARY,
-        ).pack(anchor="w", padx=18, pady=(18, 10))
-
-        self.list_frame = ctk.CTkScrollableFrame(self, fg_color=theme.BG_PANEL, label_text="")
-        self.list_frame.pack(fill="both", expand=True, padx=18, pady=8)
-
-        button_row = ctk.CTkFrame(self, fg_color="transparent")
-        button_row.pack(fill="x", padx=18, pady=(0, 18))
-        _styled_button(
-            button_row, text=t(lang, "add_folder_btn"), image=folder_icon(16, theme.TEXT_PRIMARY),
-            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, text_color=theme.ACCENT_TEXT,
-            command=self._add_folder,
-        ).pack(side="left")
-        _styled_button(button_row, text=t(lang, "close"), command=self.destroy).pack(side="right")
-
-        self._refresh_list()
-
-    def _refresh_list(self):
-        for child in self.list_frame.winfo_children():
+    def show(self, title: str, body: str = "", action: Optional[tuple[str, str, object]] = None) -> None:
+        self.title.configure(text=title)
+        self.body.configure(text=body)
+        if body:
+            self.body.pack(pady=(px(6), 0), before=self.actions)
+        else:
+            self.body.pack_forget()
+        for child in self.actions.winfo_children():
             child.destroy()
-        folders = self.config_store.folders
+        if action:
+            text, variant, command = action
+            icon = "plus" if variant == "primary" else None
+            FlatButton(self.actions, text=text, icon=icon, variant=variant, command=command,
+                       bg=theme.PANEL, padx=16, pady=8).pack()
+
+
+class FoldersDialog(tk.Toplevel):
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self.app = app
+        lang = app.lang
+        self.title(t(lang, "folders_title"))
+        self.configure(bg=theme.BG)
+        self.geometry(f"{px(640)}x{px(430)}")
+        self.minsize(px(460), px(320))
+        self.transient(app)
+        _dark_title_bar(self)
+
+        pad = px(26)
+        tk.Label(self, text=t(lang, "folders_title"), font=theme.FONTS["empty_title"], fg=theme.TEXT,
+                 bg=theme.BG, anchor="w").pack(fill="x", padx=pad, pady=(pad, px(2)))
+        tk.Label(self, text=t(lang, "folders_body"), font=theme.FONTS["body"], fg=theme.TEXT_2, bg=theme.BG,
+                 anchor="w", justify="left").pack(fill="x", padx=pad)
+
+        self.list = tk.Frame(self, bg=theme.PANEL, highlightthickness=1, highlightbackground=theme.LINE)
+        self.list.pack(fill="both", expand=True, padx=pad, pady=px(18))
+
+        footer = tk.Frame(self, bg=theme.BG)
+        footer.pack(fill="x", padx=pad, pady=(0, pad))
+        FlatButton(footer, text=t(lang, "add_folder"), icon="plus", variant="secondary", bg=theme.BG,
+                   command=self._add, padx=14, pady=8).pack(side="left")
+        FlatButton(footer, text=t(lang, "done"), variant="primary", bg=theme.BG,
+                   command=self.destroy, padx=20, pady=8).pack(side="right")
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._render()
+        self.focus_set()
+
+    def _render(self) -> None:
+        for child in self.list.winfo_children():
+            child.destroy()
+        lang = self.app.lang
+        folders = self.app.config_store.folders
         if not folders:
-            ctk.CTkLabel(
-                self.list_frame, text=t(self.lang, "no_folders_yet"), text_color=theme.TEXT_SECONDARY
-            ).pack(pady=8)
-        for folder in folders:
-            row = ctk.CTkFrame(self.list_frame, fg_color="transparent")
-            row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=folder, anchor="w", text_color=theme.TEXT_PRIMARY).pack(
-                side="left", fill="x", expand=True
-            )
-            _styled_button(
-                row, text=t(self.lang, "remove"), width=76, fg_color=theme.DANGER, hover_color=theme.DANGER_HOVER,
-                command=lambda f=folder: self._remove_folder(f),
-            ).pack(side="right")
+            tk.Label(self.list, text=t(lang, "no_folders_yet"), font=theme.FONTS["body"], fg=theme.TEXT_3,
+                     bg=theme.PANEL, anchor="w").pack(fill="x", padx=px(16), pady=px(16))
+            return
+        for i, folder in enumerate(folders):
+            if i:
+                tk.Frame(self.list, bg=theme.LINE, height=1).pack(fill="x", padx=px(12))
+            row = tk.Frame(self.list, bg=theme.PANEL)
+            row.pack(fill="x", padx=px(6), pady=px(4))
+            FlatButton(row, text=t(lang, "remove"), variant="danger", bg=theme.PANEL, padx=10, pady=5,
+                       command=lambda f=folder: self._remove(f)).pack(side="right")
+            tk.Label(row, image=icons.icon("folder", px(16), theme.TEXT_3), bg=theme.PANEL).pack(
+                side="left", padx=(px(8), px(10)))
+            path_label = tk.Label(row, font=theme.FONTS["body"], fg=theme.TEXT, bg=theme.PANEL, anchor="w",
+                                  width=1)
+            path_label.pack(side="left", fill="x", expand=True)
+            path_label.bind("<Configure>", lambda e, lbl=path_label, f=folder: lbl.configure(
+                text=theme.elide_start(f, theme.FONTS["body"], e.width - px(4))))
 
-    def _add_folder(self):
-        folder = filedialog.askdirectory(title=t(self.lang, "select_folder_dialog"))
-        if folder:
-            self.config_store.add_folder(folder)
-            self._refresh_list()
-            self.on_change()
+    def _add(self) -> None:
+        folder = filedialog.askdirectory(parent=self, title=t(self.app.lang, "select_folder_dialog"))
+        if folder and self.app.config_store.add_folder(folder):
+            self._render()
+            self.app.rescan()
 
-    def _remove_folder(self, folder: str):
-        self.config_store.remove_folder(folder)
-        self._refresh_list()
-        self.on_change()
+    def _remove(self, folder: str) -> None:
+        self.app.config_store.remove_folder(folder)
+        self._render()
+        self.app.rescan()
 
 
-class App(ctk.CTk):
+class App(tk.Tk):
     def __init__(self):
-        super().__init__()
+        _enable_dpi_awareness()
+        super().__init__(className="HOI4MusicPlayer")
+        self.withdraw()
+        families = fonts.register_bundled_fonts(self)
+        theme.init(self, families)
+        setup_styles(self)
+        _style_stock_widgets(self)
+
         self.config_store = Config()
         self.lang = self.config_store.language
 
         self.title(t(self.lang, "app_title"))
-        self.geometry("1080x700")
-        self.minsize(880, 580)
-        self.configure(fg_color=theme.BG_APP)
+        self.configure(bg=theme.BG)
+        self.geometry(f"{px(1200)}x{px(760)}")
+        self.minsize(px(960), px(600))
         self._set_window_icon()
-        # Set before any ttk (Treeview/Scrollbar) widget is created - see
-        # the comment in TrackListView._configure_style for why this
-        # specific theme matters.
-        ttk.Style(self).theme_use("clam")
 
         self.player = PlayerEngine()
         self.player.volume = self.config_store.volume
+        self.player.set_shuffle(self.config_store.shuffle)
+        self.player.set_repeat(RepeatMode(self.config_store.repeat))
         self.player.on_track_change = self._on_track_change
         self.player.on_playback_state_change = self._on_playback_state_change
 
         self.stations: list[Station] = []
-        self.station_rows: dict[str, StationRow] = {}
+        self._station_key_by_path: dict[Path, str] = {}
+        self.empty_mod_names: list[str] = []
         self.selected_station_key: Optional[str] = None
         self.current_display_tracks: list[Track] = []
         self._scanning = False
         self._search_after_id: Optional[str] = None
         self._duration_backlog: list[Track] = []
+        self._volume_before_mute = self.config_store.volume or 0.7
+        self._page_title_text = ""
+        self._now_texts = ("", "")
 
-        self.search_var = ctk.StringVar()
+        self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._schedule_search_refresh())
 
-        self._build_layout()
+        self._build()
+        self._bind_keys()
+        self._apply_language()
+        self._on_track_change(None)
+
+        self.deiconify()
+        _dark_title_bar(self)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.rescan()
         self._tick()
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _set_window_icon(self):
-        # PyInstaller's --icon only sets the .exe file's icon in Explorer,
-        # not the running window/taskbar icon (which was showing Tk's
-        # default feather logo) - it has to be set at runtime too. Generate
-        # the icon in-process (see utils.get_app_icon_image) rather than
-        # loading a bundled file, so the packaged .exe doesn't need any
-        # asset files shipped alongside it.
+    def _set_window_icon(self) -> None:
+        # Generated in-process, so a packaged build needs no icon files.
         try:
-            # Passing several sizes lets Tk/the window manager pick the best
-            # fit for each context (title bar, taskbar, Alt-Tab) instead of
-            # scaling a single 64px image, which looked soft when shrunk
-            # down for a small taskbar slot.
-            self._window_icon_photos = [
-                ImageTk.PhotoImage(get_app_icon_image(size)) for size in (16, 24, 32, 48, 64, 128)
-            ]
-            self.iconphoto(True, *self._window_icon_photos)
+            self._icon_photos = [ImageTk.PhotoImage(app_icon(size)) for size in (16, 24, 32, 48, 64, 128, 256)]
+            self.iconphoto(True, *self._icon_photos)
         except Exception:
             pass
         if sys.platform == "win32":
             try:
-                self.iconbitmap(str(get_app_icon_ico_path()))
+                self.iconbitmap(default=str(temp_ico_path()))
             except Exception:
                 pass
 
-    # --------------------------------------------------------------- i18n
-    def _other_language(self) -> str:
-        others = [code for code in i18n.LANGUAGES if code != self.lang]
-        return others[0] if others else self.lang
+    # ------------------------------------------------------------- layout
+    def _build(self) -> None:
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(2, weight=1)
+        self._build_sidebar()
+        tk.Frame(self, bg=theme.LINE, width=1).grid(row=0, column=1, sticky="ns")
+        self._build_content()
+        self._build_deck()
 
-    def _toggle_language(self):
-        self.lang = self._other_language()
-        self.config_store.language = self.lang
-        self._apply_language()
-        self.rescan()  # re-resolve track/station titles in the new language
+    def _build_sidebar(self) -> None:
+        side = tk.Frame(self, bg=theme.SURFACE, width=px(SIDEBAR_WIDTH))
+        side.grid(row=0, column=0, sticky="ns")
+        side.pack_propagate(False)
 
-    def _apply_language(self):
-        self.title(t(self.lang, "app_title"))
-        self.brand_label.configure(text=t(self.lang, "app_title"))
-        self.manage_folders_btn.configure(text=t(self.lang, "manage_folders"))
-        self.search_entry.configure(placeholder_text=t(self.lang, "search_placeholder"))
-        self.language_btn.configure(text=self._other_language().upper())
-        self.stations_header_label.configure(text=t(self.lang, "stations"))
-        self.all_stations_row.configure(text=t(self.lang, "all_stations"))
-        self.play_all_btn.configure(text=t(self.lang, "play_all"))
-        self.track_list_view.set_language(self.lang)
-        self.empty_tracks_label.configure(text=t(self.lang, "no_tracks_message"))
-        if self.player.current_track is None:
-            self.now_title_label.configure(text=t(self.lang, "nothing_playing"))
-            self.now_meta_label.configure(text=t(self.lang, "add_folder_hint"))
-
-    # ------------------------------------------------------------------ UI
-    def _build_layout(self):
-        self.grid_columnconfigure(0, weight=0)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-
-        # Top bar
-        top_bar = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_TOPBAR, height=58)
-        top_bar.grid(row=0, column=0, columnspan=2, sticky="ew")
-        top_bar.grid_propagate(False)
-
-        brand = ctk.CTkFrame(top_bar, fg_color="transparent")
-        brand.pack(side="left", padx=(16, 24))
-        ctk.CTkLabel(brand, text="", image=get_icon_image(None, 28)).pack(side="left", padx=(0, 8))
-        self.brand_label = ctk.CTkLabel(
-            brand, text=t(self.lang, "app_title"), font=ctk.CTkFont(size=15, weight="bold"),
-            text_color=theme.TEXT_PRIMARY,
-        )
+        brand = tk.Frame(side, bg=theme.SURFACE, height=px(TOOLBAR_HEIGHT))
+        brand.pack(fill="x")
+        brand.pack_propagate(False)
+        self._logo = ImageTk.PhotoImage(app_icon(px(30)))
+        tk.Label(brand, image=self._logo, bg=theme.SURFACE).pack(side="left", padx=(px(18), px(11)))
+        self.brand_label = tk.Label(brand, font=theme.FONTS["brand"], fg=theme.TEXT, bg=theme.SURFACE)
         self.brand_label.pack(side="left")
+        tk.Frame(side, bg=theme.LINE, height=1).pack(fill="x")
 
-        self.manage_folders_btn = _styled_button(
-            top_bar, text=t(self.lang, "manage_folders"), image=folder_icon(16, theme.TEXT_PRIMARY),
-            command=self._open_folder_manager,
-        )
-        self.manage_folders_btn.pack(side="left", padx=(0, 8), pady=10)
-        _styled_button(
-            top_bar, text="", image=refresh_icon(16, theme.TEXT_PRIMARY), width=36,
-            command=self.rescan,
-        ).pack(side="left", pady=10)
+        self.stations_label = tk.Label(side, font=theme.FONTS["label"], fg=theme.TEXT_3, bg=theme.SURFACE,
+                                       anchor="w")
+        self.stations_label.pack(fill="x", padx=px(18), pady=(px(18), px(6)))
+        self.station_list = StationList(side, on_select=self._select_station, on_toggle=self._toggle_station,
+                                        on_activate=self._play_station)
+        self.station_list.pack(fill="both", expand=True, pady=(0, px(8)))
 
-        self.status_label = ctk.CTkLabel(top_bar, text="", text_color=theme.TEXT_SECONDARY)
-        self.status_label.pack(side="left", padx=14)
+    def _build_content(self) -> None:
+        content = tk.Frame(self, bg=theme.PANEL)
+        content.grid(row=0, column=2, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(3, weight=1)
 
-        # Packed before the search entry (both side="right") so it always
-        # claims its space at the far-right edge first and can never end up
-        # squeezed out if the window is narrow or the status text is long.
-        self.language_btn = _styled_button(
-            top_bar, text=self._other_language().upper(), width=48,
-            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, text_color=theme.ACCENT_TEXT,
-            command=self._toggle_language,
-        )
-        self.language_btn.pack(side="right", padx=(0, 16), pady=10)
+        toolbar = tk.Frame(content, bg=theme.PANEL, height=px(TOOLBAR_HEIGHT))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.pack_propagate(False)
+        self.lang_switch = LangSwitch(toolbar, i18n.LANGUAGES, self.lang, self._set_language, bg=theme.PANEL)
+        self.lang_switch.pack(side="right", padx=(px(6), px(22)))
+        tk.Frame(toolbar, bg=theme.LINE, width=1).pack(side="right", fill="y", pady=px(20), padx=px(8))
+        self.folders_btn = FlatButton(toolbar, icon="folder", command=self._open_folders, bg=theme.PANEL)
+        self.folders_btn.pack(side="right")
+        self.refresh_btn = FlatButton(toolbar, icon="refresh", command=self.rescan, bg=theme.PANEL, padx=9,
+                                      tooltip=lambda: t(self.lang, "rescan"))
+        self.refresh_btn.pack(side="right", padx=(0, px(2)))
+        self.search = SearchBox(toolbar, self.search_var, "")
+        self.search.entry.configure(width=34)
+        self.search.pack(side="left", padx=(px(24), px(16)), pady=px(14))
+        tk.Frame(content, bg=theme.LINE, height=1).grid(row=1, column=0, sticky="ew")
 
-        self.search_entry = ctk.CTkEntry(
-            top_bar, placeholder_text=t(self.lang, "search_placeholder"),
-            textvariable=self.search_var, width=220, fg_color=theme.BG_ROW,
-            border_color=theme.BORDER, text_color=theme.TEXT_PRIMARY,
-        )
-        self.search_entry.pack(side="right", padx=(16, 0), pady=10)
+        header = tk.Frame(content, bg=theme.PANEL)
+        header.grid(row=2, column=0, sticky="ew", padx=px(26), pady=(px(24), px(16)))
+        header.grid_columnconfigure(0, weight=1)
+        self.page_title = tk.Label(header, font=theme.FONTS["page_title"], fg=theme.TEXT, bg=theme.PANEL,
+                                   anchor="w", width=1)
+        self.page_title.grid(row=0, column=0, sticky="ew")
+        self.page_title.bind("<Configure>", lambda e: self._render_page_title())
+        self.page_meta = tk.Label(header, font=theme.FONTS["mono"], fg=theme.TEXT_2, bg=theme.PANEL, anchor="w")
+        self.page_meta.grid(row=1, column=0, sticky="w", pady=(px(3), 0))
+        self.play_btn = FlatButton(header, icon="play", variant="primary", command=self._play_all,
+                                   bg=theme.PANEL, padx=18, pady=9)
+        self.play_btn.grid(row=0, column=1, rowspan=2, sticky="e", padx=(px(16), 0))
 
-        # Sidebar (stations). Fixed width - a live drag-to-resize handle was
-        # tried and reverted: CTkFrame's canvas redraw couldn't keep up
-        # with rapid <B1-Motion> events and left visible ghost artifacts on
-        # screen. Long station names just wrap onto extra lines instead
-        # (see SIDEBAR_LABEL_WRAP), so a fixed width doesn't clip anything.
-        self.sidebar = ctk.CTkFrame(self, width=SIDEBAR_WIDTH, corner_radius=0, fg_color=theme.BG_SIDEBAR)
-        self.sidebar.grid(row=1, column=0, sticky="ns")
-        self.sidebar.grid_propagate(False)
-        self.stations_header_label = ctk.CTkLabel(
-            self.sidebar, text=t(self.lang, "stations"), font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=theme.TEXT_MUTED,
-        )
-        self.stations_header_label.pack(anchor="w", padx=16, pady=(16, 6))
-        self.all_stations_row = _styled_button(
-            self.sidebar, text=t(self.lang, "all_stations"), anchor="w",
-            fg_color=theme.BG_ROW_SELECTED, hover_color=theme.BG_ROW_HOVER,
-            command=lambda: self._select_station(None),
-        )
-        self.all_stations_row.pack(fill="x", padx=14, pady=(0, 10))
+        body = tk.Frame(content, bg=theme.PANEL)
+        body.grid(row=3, column=0, sticky="nsew", padx=(px(14), 0))
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+        self.table = TrackTable(body, on_play=self._play_track, headings=self._headings())
+        self.table.grid(row=0, column=0, sticky="nsew")
+        # Both stay gridded in the same cell; whichever is needed is raised.
+        self.empty_state = EmptyState(body)
+        self.empty_state.grid(row=0, column=0, sticky="nsew")
+        self.empty_state.lower(self.table)
 
-        self.stations_scroll = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent", label_text="")
-        self.stations_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    def _build_deck(self) -> None:
+        deck = tk.Frame(self, bg=theme.SURFACE)
+        deck.grid(row=1, column=0, columnspan=3, sticky="ew")
+        tk.Frame(deck, bg=theme.LINE, height=1).pack(fill="x")
 
-        # Track list
-        track_panel = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_PANEL)
-        track_panel.grid(row=1, column=1, sticky="nsew")
-        track_panel.grid_rowconfigure(1, weight=1)
-        track_panel.grid_columnconfigure(0, weight=1)
+        strip = tk.Frame(deck, bg=theme.SURFACE)
+        strip.pack(fill="x", padx=px(22), pady=(px(10), 0))
+        self.elapsed_label = tk.Label(strip, text="0:00", font=theme.FONTS["mono"], fg=theme.TEXT_2,
+                                      bg=theme.SURFACE, width=5, anchor="w")
+        self.elapsed_label.pack(side="left", anchor="s", pady=(0, px(2)))
+        self.total_label = tk.Label(strip, font=theme.FONTS["mono"], fg=theme.TEXT_3, bg=theme.SURFACE,
+                                    width=5, anchor="e")
+        self.total_label.pack(side="right", anchor="s", pady=(0, px(2)))
+        self.dial = Dial(strip, bg=theme.SURFACE, on_drag=self._on_dial_drag, on_seek=self._on_dial_seek)
+        self.dial.pack(side="left", fill="x", expand=True, padx=px(10))
 
-        header = ctk.CTkFrame(track_panel, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        self.track_count_label = ctk.CTkLabel(
-            header, text=t(self.lang, "tracks_header", count=0), font=ctk.CTkFont(size=15, weight="bold"),
-            text_color=theme.TEXT_PRIMARY,
-        )
-        self.track_count_label.pack(side="left")
-        self.play_all_btn = _styled_button(
-            header, text=t(self.lang, "play_all"), image=play_icon(14, theme.ACCENT_TEXT), width=110,
-            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, text_color=theme.ACCENT_TEXT,
-            command=self._play_all,
-        )
-        self.play_all_btn.pack(side="right")
+        row = tk.Frame(deck, bg=theme.SURFACE)
+        row.pack(fill="x", padx=px(22), pady=(px(8), px(16)))
+        row.grid_columnconfigure(0, weight=1, uniform="side")
+        row.grid_columnconfigure(2, weight=1, uniform="side")
 
-        self.track_list_view = TrackListView(track_panel, on_play=self._play_track, lang=self.lang)
-        self.track_list_view.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        now = tk.Frame(row, bg=theme.SURFACE)
+        now.grid(row=0, column=0, sticky="ew")
+        self.cover_label = tk.Label(now, bg=theme.SURFACE, cursor="hand2")
+        self.cover_label.pack(side="left")
+        text_col = tk.Frame(now, bg=theme.SURFACE)
+        text_col.pack(side="left", fill="x", expand=True, padx=(px(14), px(12)))
+        self.now_title = tk.Label(text_col, font=theme.FONTS["now_title"], fg=theme.TEXT, bg=theme.SURFACE,
+                                  anchor="w", width=1, cursor="hand2")
+        self.now_title.pack(fill="x")
+        self.now_sub = tk.Label(text_col, font=theme.FONTS["small"], fg=theme.TEXT_2, bg=theme.SURFACE,
+                                anchor="w", width=1)
+        self.now_sub.pack(fill="x", pady=(px(1), 0))
+        self.now_title.bind("<Configure>", lambda e: self._render_now_texts())
+        for widget in (self.cover_label, self.now_title):
+            widget.bind("<Button-1>", lambda e: self.table.reveal_playing())
 
-        self.empty_tracks_label = ctk.CTkLabel(
-            track_panel, text=t(self.lang, "no_tracks_message"),
-            wraplength=520, justify="left", text_color=theme.TEXT_SECONDARY,
-        )
-        self.empty_tracks_label.grid(row=1, column=0, sticky="nw", padx=14, pady=(4, 14))
-        self.empty_tracks_label.grid_remove()
+        transport = tk.Frame(row, bg=theme.SURFACE)
+        transport.grid(row=0, column=1)
+        button = dict(bg=theme.SURFACE, icon_size=18, padx=9, pady=9)
+        self.shuffle_btn = FlatButton(transport, icon="shuffle", variant="toggle", command=self._toggle_shuffle,
+                                      tooltip=lambda: t(self.lang, "shuffle"), **button)
+        self.shuffle_btn.pack(side="left", padx=(0, px(10)))
+        FlatButton(transport, icon="prev", command=self.player.previous, **button).pack(side="left")
+        self.play_knob = KnobButton(transport, 46, command=self._toggle_play_pause, bg=theme.SURFACE)
+        self.play_knob.pack(side="left", padx=px(12))
+        FlatButton(transport, icon="next", command=self.player.next, **button).pack(side="left")
+        self.repeat_btn = FlatButton(transport, icon="repeat", variant="toggle", command=self._cycle_repeat,
+                                     tooltip=lambda: t(self.lang, "repeat"), **button)
+        self.repeat_btn.pack(side="left", padx=(px(10), 0))
+        self._sync_mode_buttons()
 
-        # Now playing bar
-        self._build_now_playing_bar()
+        volume = tk.Frame(row, bg=theme.SURFACE)
+        volume.grid(row=0, column=2, sticky="e")
+        self.volume_btn = FlatButton(volume, icon=self._volume_icon(self.config_store.volume),
+                                     command=self._toggle_mute, **button)
+        self.volume_btn.pack(side="left", padx=(0, px(6)))
+        self.volume_slider = Slider(volume, 124, bg=theme.SURFACE, value=self.config_store.volume,
+                                    on_change=self._on_volume_change)
+        self.volume_slider.pack(side="left")
 
-    def _build_now_playing_bar(self):
-        bar = ctk.CTkFrame(self, height=100, corner_radius=0, fg_color=theme.BG_NOWPLAYING,
-                            border_width=0)
-        bar.grid(row=2, column=0, columnspan=2, sticky="ew")
-        bar.grid_propagate(False)
-        bar.grid_columnconfigure(1, weight=1)
+    def _bind_keys(self) -> None:
+        self.bind_all("<space>", self._on_space)
+        self.bind_all("<Control-f>", lambda e: (self.search.entry.focus_set(), "break")[1])
+        self.bind_all("<Escape>", self._on_escape)
 
-        divider = ctk.CTkFrame(self, height=1, fg_color=theme.BORDER, corner_radius=0)
-        divider.grid(row=2, column=0, columnspan=2, sticky="new")
+    # --------------------------------------------------------------- i18n
+    def _headings(self) -> dict[str, str]:
+        return {key: t(self.lang, f"col_{key}") for key in ("title", "author", "station", "mod", "time")}
 
-        self.now_icon_label = ctk.CTkLabel(bar, text="", image=get_icon_image(None, NOWPLAYING_ICON_SIZE))
-        self.now_icon_label.grid(row=0, column=0, rowspan=3, padx=14, pady=12)
+    def _set_language(self, lang: str) -> None:
+        if lang == self.lang:
+            return
+        self.lang = lang
+        self.config_store.language = lang
+        self._apply_language()
+        self.rescan()  # track/station titles come from the mods' own localisation
 
-        self.now_title_label = ctk.CTkLabel(
-            bar, text=t(self.lang, "nothing_playing"), anchor="w", font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=theme.TEXT_PRIMARY,
-        )
-        self.now_title_label.grid(row=0, column=1, sticky="ew", padx=8, pady=(12, 0))
+    def _apply_language(self) -> None:
+        lang = self.lang
+        self.title(t(lang, "app_title"))
+        self.brand_label.configure(text=t(lang, "app_title"))
+        self.stations_label.configure(text=t(lang, "stations").upper())
+        self.search.set_placeholder(t(lang, "search_placeholder"))
+        self.folders_btn.set_text(t(lang, "folders"))
+        self.play_btn.set_text(t(lang, "play"))
+        self.lang_switch.set(lang)
+        self.table.set_headings(self._headings())
+        self.table.unknown_author = t(lang, "unknown_author")
+        if self.player.current_track is None:
+            self._on_track_change(None)
+        self._render_station_list()
+        self._refresh_track_list()
 
-        self.now_meta_label = ctk.CTkLabel(
-            bar, text=t(self.lang, "add_folder_hint"), anchor="w",
-            text_color=theme.TEXT_SECONDARY,
-        )
-        self.now_meta_label.grid(row=1, column=1, sticky="ew", padx=8)
-
-        progress_row = ctk.CTkFrame(bar, fg_color="transparent")
-        progress_row.grid(row=2, column=1, sticky="ew", padx=8, pady=(4, 10))
-        progress_row.grid_columnconfigure(1, weight=1)
-        self.elapsed_label = ctk.CTkLabel(progress_row, text="0:00", width=40, text_color=theme.TEXT_SECONDARY)
-        self.elapsed_label.grid(row=0, column=0)
-        # A CTkSlider, not a CTkProgressBar - lets the user click/drag to
-        # seek. _seeking tracks whether the user currently has the handle
-        # grabbed, so the periodic playback-position update in _tick()
-        # doesn't fight the drag.
-        self._seeking = False
-        self.progress_bar = ctk.CTkSlider(
-            progress_row, from_=0, to=1, number_of_steps=1000,
-            progress_color=theme.ACCENT, button_color=theme.ACCENT,
-            button_hover_color=theme.ACCENT_HOVER, fg_color=theme.BUTTON_NEUTRAL,
-            command=self._on_seek_drag,
-        )
-        self.progress_bar.set(0)
-        self.progress_bar.grid(row=0, column=1, sticky="ew", padx=10)
-        self.progress_bar.bind("<ButtonPress-1>", self._on_seek_start, add="+")
-        self.progress_bar.bind("<ButtonRelease-1>", self._on_seek_end, add="+")
-        self.duration_label = ctk.CTkLabel(progress_row, text="--:--", width=40, text_color=theme.TEXT_SECONDARY)
-        self.duration_label.grid(row=0, column=2)
-
-        controls = ctk.CTkFrame(bar, fg_color="transparent")
-        controls.grid(row=0, column=2, rowspan=3, padx=16)
-
-        transport = ctk.CTkFrame(controls, fg_color="transparent")
-        transport.pack()
-
-        _styled_button(
-            transport, text="", image=previous_icon(16, theme.TEXT_PRIMARY), width=34, height=34,
-            corner_radius=17, command=self.player.previous,
-        ).pack(side="left", padx=3)
-
-        self.play_pause_btn = _styled_button(
-            transport, text="", image=play_icon(18, theme.ACCENT_TEXT), width=44, height=44,
-            corner_radius=22, fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
-            command=self._toggle_play_pause,
-        )
-        self.play_pause_btn.pack(side="left", padx=5)
-
-        _styled_button(
-            transport, text="", image=next_icon(16, theme.TEXT_PRIMARY), width=34, height=34,
-            corner_radius=17, command=lambda: self.player.next(),
-        ).pack(side="left", padx=3)
-
-        volume_row = ctk.CTkFrame(controls, fg_color="transparent")
-        volume_row.pack(pady=(8, 0), fill="x")
-        ctk.CTkLabel(volume_row, text="", image=volume_icon(16, theme.TEXT_SECONDARY), width=20).pack(side="left")
-        self.volume_slider = ctk.CTkSlider(
-            volume_row, from_=0, to=100, number_of_steps=100, command=self._on_volume_change,
-            progress_color=theme.ACCENT, button_color=theme.ACCENT, button_hover_color=theme.ACCENT_HOVER,
-            fg_color=theme.BUTTON_NEUTRAL,
-        )
-        self.volume_slider.set(self.config_store.volume * 100)
-        self.volume_slider.pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-    # ------------------------------------------------------------- scanning
-    def rescan(self):
+    # ----------------------------------------------------------- scanning
+    def rescan(self) -> None:
         if self._scanning:
             return
         folders = self.config_store.folders
         if not folders:
-            self.status_label.configure(text=t(self.lang, "no_folders"))
-            self._on_scan_complete([])
+            self._on_scan_complete([], [])
             return
         self._scanning = True
-        self.status_label.configure(text=t(self.lang, "scanning"))
+        self._refresh_track_list()
         language = self.lang
 
         def work():
@@ -638,226 +440,313 @@ class App(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_scan_complete(self, stations: list[Station], empty_mod_names: list[str] = ()):
+    def _on_scan_complete(self, stations: list[Station], empty_mod_names: list[str]) -> None:
         self._scanning = False
         self.stations = stations
-        total_tracks = sum(s.track_count for s in stations)
-        if stations:
-            status = t(self.lang, "stations_summary", count=len(stations), tracks=total_tracks)
-            if empty_mod_names:
-                status += t(self.lang, "more_empty_mods", count=len(empty_mod_names))
-            self.status_label.configure(text=status)
-        elif empty_mod_names:
-            names = ", ".join(empty_mod_names[:3])
-            if len(empty_mod_names) > 3:
-                names += f", +{len(empty_mod_names) - 3} more"
-            self.status_label.configure(text=t(self.lang, "found_empty_mods", names=names))
-        elif self.config_store.folders:
-            self.status_label.configure(text=t(self.lang, "no_mod_found"))
-        self._rebuild_station_list()
+        self._station_key_by_path = {track.file_path: s.key for s in stations for track in s.tracks}
+        self.empty_mod_names = list(empty_mod_names)
+        if self.selected_station_key not in {s.key for s in stations}:
+            self.selected_station_key = None
+        self._render_station_list()
         self._refresh_track_list()
 
-        # Read every track's length up front so the list shows real times
-        # instead of '--:--' without waiting for playback. This is done in
-        # small chunks on the main thread via `after`, NOT a background
-        # thread: a ThreadPoolExecutor here reliably triggered a fatal,
-        # unrecoverable interpreter crash (GIL corruption) when running
-        # concurrently with pygame's mixer + the Tk mainloop. Chunking
-        # keeps each pause imperceptible even for large mods.
+        # Durations are read on the main thread in small batches: reading them
+        # on a worker thread alongside pygame's mixer and the Tk mainloop
+        # crashed the interpreter (GIL corruption).
         self._duration_backlog = [track for s in stations for track in s.tracks if track.duration is None]
         if self._duration_backlog:
             self.after(50, self._process_duration_backlog)
 
-    def _process_duration_backlog(self):
+    def _process_duration_backlog(self) -> None:
         batch, self._duration_backlog = self._duration_backlog[:5], self._duration_backlog[5:]
         for track in batch:
             compute_track_duration(track)
-            self.track_list_view.update_track_duration(track)
+            self.table.update_track_duration(track)
         if self._duration_backlog:
             self.after(15, self._process_duration_backlog)
 
-    def _open_folder_manager(self):
-        FolderManagerDialog(self, self.config_store, on_change=self.rescan, lang=self.lang)
+    def _open_folders(self) -> None:
+        FoldersDialog(self)
 
-    # ------------------------------------------------------------- search
-    def _schedule_search_refresh(self):
+    def _add_folder_directly(self) -> None:
+        folder = filedialog.askdirectory(parent=self, title=t(self.lang, "select_folder_dialog"))
+        if folder and self.config_store.add_folder(folder):
+            self.rescan()
+
+    # ------------------------------------------------------------ stations
+    def _enabled_stations(self) -> list[Station]:
+        disabled = self.config_store.disabled_station_keys
+        return [s for s in self.stations if s.key not in disabled]
+
+    def _render_station_list(self) -> None:
+        lang = self.lang
+        disabled = self.config_store.disabled_station_keys
+        rows: list[StationRowData] = []
+        if self.stations:
+            total = sum(s.track_count for s in self._enabled_stations())
+            rows.append(StationRowData(
+                None, t(lang, "all_stations"), i18n.count(lang, len(self.stations), "station"),
+                i18n.number(lang, total),
+            ))
+        for station in self.stations:
+            sub = station.mod_name if station.mod_name != station.name else ""
+            rows.append(StationRowData(
+                station.key, station.name, sub, i18n.number(lang, station.track_count),
+                enabled=station.key not in disabled,
+            ))
+        self.station_list.set_rows(rows, self.selected_station_key)
+
+    def _toggle_station(self, key: str, enabled: bool) -> None:
+        self.config_store.set_station_enabled(key, enabled)
+        self._render_station_list()
+        self._refresh_track_list()
+
+    def _select_station(self, key: Optional[str]) -> None:
+        self.selected_station_key = key
+        self.station_list.set_selected(key)
+        self._refresh_track_list()
+
+    def _play_station(self, key: Optional[str]) -> None:
+        self._select_station(key)
+        self._play_all()
+
+    # -------------------------------------------------------------- tracks
+    def _schedule_search_refresh(self) -> None:
         if self._search_after_id is not None:
             self.after_cancel(self._search_after_id)
         self._search_after_id = self.after(180, self._run_scheduled_search_refresh)
 
-    def _run_scheduled_search_refresh(self):
+    def _run_scheduled_search_refresh(self) -> None:
         self._search_after_id = None
         self._refresh_track_list()
 
-    # ------------------------------------------------------------ stations
-    def _rebuild_station_list(self):
-        for child in self.stations_scroll.winfo_children():
-            child.destroy()
-        self.station_rows.clear()
-
-        valid_keys = {s.key for s in self.stations}
-        if self.selected_station_key not in valid_keys:
-            self.selected_station_key = None
-
-        for station in self.stations:
-            enabled = station.key not in self.config_store.disabled_station_keys
-            row = StationRow(
-                self.stations_scroll, station, enabled,
-                on_toggle=self._on_station_toggle, on_select=self._select_station, lang=self.lang,
-            )
-            row.pack(fill="x", pady=4)
-            row.set_selected(self.selected_station_key == station.key)
-            self.station_rows[station.key] = row
-
-        self.all_stations_row.configure(
-            fg_color=theme.BG_ROW_SELECTED if self.selected_station_key is None else theme.BUTTON_NEUTRAL
-        )
-
-    def _on_station_toggle(self, station_key: str, enabled: bool):
-        self.config_store.set_station_enabled(station_key, enabled)
-        self._refresh_track_list()
-
-    def _select_station(self, station_key: Optional[str]):
-        self.selected_station_key = station_key
-        for key, row in self.station_rows.items():
-            row.set_selected(key == station_key)
-        self.all_stations_row.configure(
-            fg_color=theme.BG_ROW_SELECTED if station_key is None else theme.BUTTON_NEUTRAL
-        )
-        self._refresh_track_list()
-
-    # -------------------------------------------------------------- tracks
     def _visible_stations(self) -> list[Station]:
-        # A disabled station's tracks never show up, whether browsing "All
-        # Stations" or that station specifically - the checkbox is the
-        # single source of truth for "will this station's music ever play".
-        disabled = self.config_store.disabled_station_keys
-        enabled_stations = [s for s in self.stations if s.key not in disabled]
+        # A disabled station's tracks never show up or play anywhere - the
+        # lamp is the single source of truth for that.
+        enabled = self._enabled_stations()
         if self.selected_station_key is not None:
-            return [s for s in enabled_stations if s.key == self.selected_station_key]
-        return enabled_stations
+            return [s for s in enabled if s.key == self.selected_station_key]
+        return enabled
 
-    def _refresh_track_list(self):
+    def _selected_station(self) -> Optional[Station]:
+        return next((s for s in self.stations if s.key == self.selected_station_key), None)
+
+    def _refresh_track_list(self) -> None:
         query = self.search_var.get().strip().lower()
-        tracks: list[Track] = []
-        for station in self._visible_stations():
-            tracks.extend(station.tracks)
+        tracks: list[Track] = [track for station in self._visible_stations() for track in station.tracks]
         if query:
             tracks = [
-                t for t in tracks
-                if query in t.display_name.lower()
-                or query in t.mod_name.lower()
-                or query in t.mod_author.lower()
-                or query in t.station_name.lower()
+                tr for tr in tracks
+                if query in tr.display_name.lower()
+                or query in tr.mod_name.lower()
+                or query in tr.mod_author.lower()
+                or query in tr.station_name.lower()
             ]
-        tracks.sort(key=lambda t: (t.station_name.lower(), t.track_title.lower()))
+        tracks.sort(key=lambda tr: (tr.station_name.lower(), tr.track_title.lower()))
         self.current_display_tracks = tracks
+        self._render_page_header(len(tracks))
+        self._render_now_texts()
 
-        self.track_count_label.configure(text=t(self.lang, "tracks_header", count=len(tracks)))
+        if tracks:
+            self.empty_state.lower(self.table)
+            self.play_btn.grid()
+            current = self.player.current_track
+            self.table.set_tracks(tracks, current.file_path if current is not None else None,
+                                  single_station=self.selected_station_key is not None)
+        else:
+            self.table.set_tracks([], None)
+            self.play_btn.grid_remove()
+            self._show_empty_state(query)
+            self.empty_state.tkraise()
 
-        current = self.player.current_track
-        current_path = current.file_path if current is not None else None
-        if not tracks:
-            self.track_list_view.set_tracks([], None)
-            self.track_list_view.grid_remove()
-            self.empty_tracks_label.grid()
-            return
+    def _show_empty_state(self, query: str) -> None:
+        lang = self.lang
+        station = self._selected_station()
+        if not self.config_store.folders:
+            self.empty_state.show(t(lang, "empty_start_title"), t(lang, "empty_start_body"),
+                                  (t(lang, "add_folder"), "primary", self._add_folder_directly))
+        elif self._scanning and not self.stations:
+            self.empty_state.show(t(lang, "scanning"))
+        elif not self.stations:
+            if self.empty_mod_names:
+                names = ", ".join(self.empty_mod_names[:3])
+                if len(self.empty_mod_names) > 3:
+                    names += f" (+{len(self.empty_mod_names) - 3})"
+                body = t(lang, "found_empty_mods", names=names)
+            else:
+                body = t(lang, "no_mod_found")
+            self.empty_state.show(t(lang, "empty_none_title"), body,
+                                  (t(lang, "manage_folders"), "secondary", self._open_folders))
+        elif station is not None and station.key in self.config_store.disabled_station_keys:
+            self.empty_state.show(t(lang, "empty_off_title"), t(lang, "empty_off_body"),
+                                  (t(lang, "turn_on"), "secondary", lambda: self._toggle_station(station.key, True)))
+        elif query:
+            self.empty_state.show(t(lang, "empty_search_title"),
+                                  t(lang, "empty_search_body", query=self.search_var.get().strip()),
+                                  (t(lang, "clear_search"), "secondary", lambda: self.search_var.set("")))
+        else:
+            self.empty_state.show(t(lang, "empty_none_title"))
 
-        self.empty_tracks_label.grid_remove()
-        self.track_list_view.grid()
-        self.track_list_view.set_tracks(tracks, current_path)
+    def _render_page_header(self, visible_count: int) -> None:
+        lang = self.lang
+        station = self._selected_station()
+        if station is None:
+            self._page_title_text = t(lang, "all_stations")
+            meta = []
+            if self.stations:
+                meta = [i18n.count(lang, len(self.stations), "station"), i18n.count(lang, visible_count, "track")]
+                if self.empty_mod_names:
+                    meta.append(i18n.count(lang, len(self.empty_mod_names), "mod_without_music"))
+        else:
+            self._page_title_text = station.name
+            meta = [station.mod_name] if station.mod_name != station.name else []
+            searching = bool(self.search_var.get().strip())
+            meta.append(i18n.count(lang, visible_count if searching else station.track_count, "track"))
+        if self._scanning:
+            meta = [t(lang, "scanning")]
+        self.page_meta.configure(text="  ·  ".join(meta).upper())
+        self._render_page_title()
 
-    def _play_all(self):
-        if not self.current_display_tracks:
-            return
-        self._play_track(self.current_display_tracks[0])
+    def _render_page_title(self) -> None:
+        width = self.page_title.winfo_width()
+        text = self._page_title_text
+        if width > 1:
+            text = theme.elide(text, theme.FONTS["page_title"], width - px(4))
+        self.page_title.configure(text=text)
 
-    def _play_track(self, track: Track):
+    def _play_all(self) -> None:
+        if self.current_display_tracks:
+            self._play_track(self.current_display_tracks[0])
+
+    def _play_track(self, track: Track) -> None:
         self.player.set_queue(self.current_display_tracks, start_track=track)
         self.player.play()
 
-    # ---------------------------------------------------------- transport
-    def _toggle_play_pause(self):
+    # ----------------------------------------------------------- transport
+    def _toggle_play_pause(self) -> None:
         if self.player.current_track is None:
             self._play_all()
             return
         self.player.toggle_pause()
 
-    def _on_volume_change(self, value: float):
-        volume = value / 100.0
+    def _toggle_shuffle(self) -> None:
+        enabled = not self.player.shuffle
+        self.player.set_shuffle(enabled)
+        self.config_store.shuffle = enabled
+        self._sync_mode_buttons()
+
+    def _cycle_repeat(self) -> None:
+        order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.ONE]
+        mode = order[(order.index(self.player.repeat) + 1) % len(order)]
+        self.player.set_repeat(mode)
+        self.config_store.repeat = mode.value
+        self._sync_mode_buttons()
+
+    def _sync_mode_buttons(self) -> None:
+        self.shuffle_btn.set_active(self.player.shuffle)
+        repeat = self.player.repeat
+        self.repeat_btn.set_icon("repeat_one" if repeat == RepeatMode.ONE else "repeat")
+        self.repeat_btn.set_active(repeat != RepeatMode.OFF)
+
+    @staticmethod
+    def _volume_icon(volume: float) -> str:
+        if volume <= 0.001:
+            return "volume_mute"
+        return "volume_low" if volume < 0.5 else "volume_high"
+
+    def _on_volume_change(self, volume: float) -> None:
         self.player.set_volume(volume)
         self.config_store.volume = volume
+        if volume > 0.001:
+            self._volume_before_mute = volume
+        self.volume_btn.set_icon(self._volume_icon(volume))
+
+    def _toggle_mute(self) -> None:
+        target = self._volume_before_mute if self.player.volume <= 0.001 else 0.0
+        self.volume_slider.set(target, notify=True)
+
+    def _on_dial_drag(self, fraction: float) -> None:
+        duration = self.player.get_duration_seconds()
+        if duration:
+            self.elapsed_label.configure(text=format_time(fraction * duration))
+
+    def _on_dial_seek(self, fraction: float) -> None:
+        duration = self.player.get_duration_seconds()
+        if duration:
+            self.player.seek(fraction * duration)
 
     # ------------------------------------------------------------ callbacks
-    def _on_track_change(self, track: Optional[Track]):
+    def _on_track_change(self, track: Optional[Track]) -> None:
         if track is None:
-            self.now_title_label.configure(text=t(self.lang, "nothing_playing"))
-            self.now_meta_label.configure(text="")
-            self.now_icon_label.configure(image=get_icon_image(None, NOWPLAYING_ICON_SIZE))
-            self.progress_bar.set(0)
+            self._now_texts = (t(self.lang, "nothing_playing"), "")
+            self.now_title.configure(fg=theme.TEXT_2)
+            self.cover_label.configure(image=cover_photo(None, px(COVER_SIZE), radius=px(4)))
             self.elapsed_label.configure(text="0:00")
-            self.duration_label.configure(text="--:--")
+            self.total_label.configure(text=format_time(None))
+            self.dial.set_state(0.0, None, active=False)
+            self.play_knob.set_glyph("play")
         else:
             author = track.track_author or t(self.lang, "unknown_author")
-            self.now_title_label.configure(text=track.track_title)
-            self.now_meta_label.configure(text=f"{track.mod_name}  •  {author}")
-            self.now_icon_label.configure(
-                image=get_icon_image(track.icon, NOWPLAYING_ICON_SIZE)
-            )
+            self._now_texts = (track.track_title, f"{author}  ·  {track.mod_name}")
+            self.now_title.configure(fg=theme.TEXT)
+            self.cover_label.configure(image=cover_photo(track.icon, px(COVER_SIZE), radius=px(4)))
             if track.duration is None:
-                # Small delay so this never competes with the audio engine
-                # actually starting playback; runs on the main thread.
+                # Short delay so this never competes with playback starting.
                 self.after(30, lambda tr=track: self._maybe_fetch_duration(tr))
-        self.track_list_view.set_playing(track.file_path if track is not None else None)
+        self._render_now_texts()
+        self.table.set_playing(track.file_path if track is not None else None)
+        self.station_list.set_live(self._station_key_by_path.get(track.file_path) if track is not None else None)
 
-    def _maybe_fetch_duration(self, track: Track):
-        if self.player.current_track is not track:
-            return
-        compute_track_duration(track)
+    def _render_now_texts(self) -> None:
+        title, sub = self._now_texts
+        if self.player.current_track is None and self.current_display_tracks:
+            sub = t(self.lang, "pick_track_hint")
+        width = self.now_title.winfo_width()
+        if width > 1:
+            title = theme.elide(title, theme.FONTS["now_title"], width - px(4))
+            sub = theme.elide(sub, theme.FONTS["small"], width - px(4))
+        self.now_title.configure(text=title)
+        self.now_sub.configure(text=sub)
 
-    def _on_playback_state_change(self, playing: bool):
-        icon = pause_icon(18, theme.ACCENT_TEXT) if playing else play_icon(18, theme.ACCENT_TEXT)
-        self.play_pause_btn.configure(image=icon)
+    def _maybe_fetch_duration(self, track: Track) -> None:
+        if self.player.current_track is track:
+            compute_track_duration(track)
+            self.table.update_track_duration(track)
+
+    def _on_playback_state_change(self, playing: bool) -> None:
+        self.play_knob.set_glyph("pause" if playing else "play")
+
+    # ------------------------------------------------------------- keyboard
+    def _typing(self) -> bool:
+        return isinstance(self.focus_get(), tk.Entry)
+
+    def _on_space(self, _e):
+        if self._typing():
+            return None
+        self._toggle_play_pause()
+        return "break"
+
+    def _on_escape(self, _e):
+        if self.search_var.get():
+            self.search_var.set("")
+        self.table.tree.focus_set()
 
     # ----------------------------------------------------------------- loop
-    def _tick(self):
+    def _tick(self) -> None:
         self.player.poll_events()
         track = self.player.current_track
         if track is not None:
             duration = self.player.get_duration_seconds()
             position = self.player.get_position_seconds()
-            self.elapsed_label.configure(text=format_time(position))
-            self.duration_label.configure(text=format_time(duration))
-            if duration and not self._seeking:
-                self.progress_bar.set(min(1.0, position / duration))
-            icon = pause_icon(18, theme.ACCENT_TEXT) if self.player.is_playing else play_icon(18, theme.ACCENT_TEXT)
-            self.play_pause_btn.configure(image=icon)
+            if not self.dial.dragging:
+                self.elapsed_label.configure(text=format_time(position))
+            self.total_label.configure(text=format_time(duration))
+            fraction = min(1.0, position / duration) if duration else 0.0
+            self.dial.set_state(fraction, duration, active=True)
+            self.play_knob.set_glyph("pause" if self.player.is_playing else "play")
         self.after(250, self._tick)
 
-    # ------------------------------------------------------------- seeking
-    def _on_seek_start(self, _event):
-        self._seeking = True
-
-    def _on_seek_drag(self, value: float):
-        # Also covers the plain-click case: CTkSlider fires its `command`
-        # for the initial click before our own ButtonPress binding runs
-        # (see bind() override in customtkinter's CTkSlider), so treat any
-        # drag/click callback as "seeking in progress" rather than relying
-        # on binding order.
-        self._seeking = True
-        if self.player.current_track is not None:
-            duration = self.player.get_duration_seconds()
-            if duration:
-                self.elapsed_label.configure(text=format_time(value * duration))
-
-    def _on_seek_end(self, _event):
-        if self.player.current_track is not None:
-            duration = self.player.get_duration_seconds()
-            if duration:
-                self.player.seek(self.progress_bar.get() * duration)
-        self._seeking = False
-
-    def _on_close(self):
+    def _on_close(self) -> None:
         self.player.stop()
         self.destroy()
 

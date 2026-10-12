@@ -1,135 +1,93 @@
-"""Small GUI helpers: time formatting and icon loading/caching."""
+"""Time formatting, cover art loading and the app-icon files Tk needs."""
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
-_icon_cache: dict[tuple[str, int], ctk.CTkImage] = {}
-_default_icon_cache: dict[int, ctk.CTkImage] = {}
-_icon_photo_cache: dict[tuple[Optional[str], int], ImageTk.PhotoImage] = {}
+from .brand import app_icon
+
+_cover_cache: dict[tuple[Optional[str], int, int], ImageTk.PhotoImage] = {}
 
 
 def format_time(seconds: Optional[float]) -> str:
     if seconds is None or seconds < 0:
-        return "--:--"
+        return "–:––"
     seconds = int(seconds)
     minutes, secs = divmod(seconds, 60)
     return f"{minutes}:{secs:02d}"
 
 
-_ICON_BG = (30, 32, 36, 255)
-_ICON_FG = (201, 162, 39, 255)
-
-
-def _make_default_icon(size: int) -> Image.Image:
-    # Supersample well past the target size, then downsample with LANCZOS -
-    # but the stroke widths below are computed in FINAL-size units first and
-    # only then scaled up, so they never shrink below ~2 final pixels. That
-    # matters more than the supersampling factor: a sub-pixel-wide stroke
-    # (e.g. the note stem) looks soft/blurry once resampled down regardless
-    # of how much supersampling was used, since there's nothing crisp left
-    # to preserve.
-    scale = 8 if size <= 32 else 4
-    s = size * scale
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([0, 0, s - 1, s - 1], radius=s // 6, fill=_ICON_BG)
-    # simple musical-note glyph
-    cx, cy = s * 0.42, s * 0.58
-    r = s * 0.14
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_ICON_FG)
-    stem_w = max(2, round(size * 0.09)) * scale
-    draw.rectangle([cx + r - stem_w, s * 0.16, cx + r, cy], fill=_ICON_FG)
-    flag_pts = [
-        (cx + r - stem_w, s * 0.16),
-        (cx + r + s * 0.18, s * 0.27),
-        (cx + r - stem_w, s * 0.38),
-    ]
-    draw.polygon(flag_pts, fill=_ICON_FG)
+def _placeholder_cover(size: int) -> Image.Image:
+    """A dark shellac record, for tracks and mods with no art of their own."""
+    ss = 4
+    s = size * ss
+    img = Image.new("RGBA", (s, s), (37, 35, 28, 255))
+    d = ImageDraw.Draw(img)
+    c = s / 2
+    d.ellipse([c - s * 0.40, c - s * 0.40, c + s * 0.40, c + s * 0.40], fill=(22, 21, 17, 255))
+    for r in (0.34, 0.27, 0.20):
+        d.ellipse([c - s * r, c - s * r, c + s * r, c + s * r], outline=(44, 42, 34, 255), width=max(1, s // 64))
+    d.ellipse([c - s * 0.11, c - s * 0.11, c + s * 0.11, c + s * 0.11], fill=(122, 52, 33, 255))
+    d.ellipse([c - s * 0.025, c - s * 0.025, c + s * 0.025, c + s * 0.025], fill=(22, 21, 17, 255))
     return img.resize((size, size), Image.LANCZOS)
 
 
-def get_app_icon_image(size: int = 64) -> Image.Image:
-    """The app's note-glyph icon as a plain PIL image (not a CTkImage), for
-    use as the window/taskbar icon via Tk's iconphoto/iconbitmap - it's
-    generated in-process rather than loaded from a bundled file, so the
-    packaged .exe doesn't need any asset files shipped alongside it."""
-    return _make_default_icon(size)
+def _round(img: Image.Image, radius: int) -> Image.Image:
+    if radius <= 0:
+        return img
+    ss = 4
+    mask = Image.new("L", (img.width * ss, img.height * ss), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, mask.width - 1, mask.height - 1], radius=radius * ss, fill=255)
+    out = img.copy()
+    out.putalpha(mask.resize(img.size, Image.LANCZOS))
+    return out
+
+
+def cover_photo(path: Optional[Path], size: int, radius: int = 0) -> ImageTk.PhotoImage:
+    key = (str(path) if path is not None else None, size, radius)
+    photo = _cover_cache.get(key)
+    if photo is not None:
+        return photo
+    img = None
+    if path is not None:
+        try:
+            with Image.open(path) as src:
+                img = src.convert("RGBA").resize((size, size), Image.LANCZOS)
+        except Exception:
+            img = None
+    if img is None:
+        img = _placeholder_cover(size)
+    photo = ImageTk.PhotoImage(_round(img, radius))
+    _cover_cache[key] = photo
+    return photo
+
+
+def blank_photo(size: int) -> ImageTk.PhotoImage:
+    key = ("blank", size, 0)
+    photo = _cover_cache.get(key)
+    if photo is None:
+        photo = ImageTk.PhotoImage(Image.new("RGBA", (size, size), (0, 0, 0, 0)))
+        _cover_cache[key] = photo
+    return photo
 
 
 _ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 
-def get_app_icon_ico_path() -> Path:
-    """Writes a multi-resolution .ico of the app icon to a temp file and
-    returns its path, for Tk's Windows-only iconbitmap(). Each size is
-    rendered independently (see _make_default_icon) and embedded directly,
-    rather than saving one large image and letting the ICO encoder
-    downscale it for the smaller sizes - Pillow's own resize for that step
-    produced a visibly soft/blurry small icon."""
+def write_ico(path: Path) -> Path:
+    """Multi-size .ico with every size rendered on its own (Pillow's ICO
+    writer would otherwise downscale one big image, which looks soft)."""
+    images = sorted((app_icon(size) for size in _ICO_SIZES), key=lambda im: im.size)
+    # The ICO writer drops any size larger than the primary image, so the
+    # largest one has to be the primary.
+    images[-1].save(path, format="ICO", sizes=[(s, s) for s in _ICO_SIZES], append_images=images[:-1])
+    return path
+
+
+def temp_ico_path() -> Path:
     tmp_dir = Path(tempfile.gettempdir()) / "hoi4_music_player"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    ico_path = tmp_dir / "app_icon.ico"
-    images = [_make_default_icon(size) for size in _ICO_SIZES]
-    # Pillow's ICO writer skips any requested size larger than the primary
-    # image passed to save() - so the primary has to be the LARGEST one
-    # (256px) for every other independently-rendered size in append_images
-    # to actually get embedded via its exact-size match, instead of being
-    # silently dropped.
-    images.sort(key=lambda im: im.size)
-    images[-1].save(
-        ico_path, format="ICO",
-        sizes=[(size, size) for size in _ICO_SIZES],
-        append_images=images[:-1],
-    )
-    return ico_path
-
-
-def get_default_icon(size: int) -> ctk.CTkImage:
-    cached = _default_icon_cache.get(size)
-    if cached is None:
-        img = _make_default_icon(size)
-        cached = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
-        _default_icon_cache[size] = cached
-    return cached
-
-
-def get_icon_image(path: Optional[Path], size: int) -> ctk.CTkImage:
-    if path is None:
-        return get_default_icon(size)
-    key = (str(path), size)
-    cached = _icon_cache.get(key)
-    if cached is not None:
-        return cached
-    try:
-        img = Image.open(path).convert("RGBA")
-        img = img.resize((size, size), Image.LANCZOS)
-    except Exception:
-        return get_default_icon(size)
-    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
-    _icon_cache[key] = ctk_img
-    return ctk_img
-
-
-def get_icon_photo(path: Optional[Path], size: int) -> ImageTk.PhotoImage:
-    """Same as get_icon_image, but as a plain Tk PhotoImage - needed for
-    widgets that don't understand CTkImage, like ttk.Treeview row icons."""
-    key = (str(path) if path is not None else None, size)
-    cached = _icon_photo_cache.get(key)
-    if cached is not None:
-        return cached
-    img = None
-    if path is not None:
-        try:
-            img = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
-        except Exception:
-            img = None
-    if img is None:
-        img = _make_default_icon(size)
-    photo = ImageTk.PhotoImage(img)
-    _icon_photo_cache[key] = photo
-    return photo
+    return write_ico(tmp_dir / "app_icon.ico")
